@@ -14,7 +14,20 @@
       {
         defaultPackage = naersk-lib.buildPackage ./.;
         devShell = with pkgs; mkShell {
-          buildInputs = [ cargo rustc rustfmt pre-commit rustPackages.clippy ];
+          buildInputs = [
+            cargo
+            rustc
+            rustfmt
+            rust-analyzer
+            pre-commit
+            rustPackages.clippy
+
+            # PDF reading: text extraction + page/figure rendering
+            poppler-utils # pdftotext, pdftoppm, pdfimages, pdfinfo
+            mupdf         # mutool: structured text (JSON/HTML), draw
+            imagemagick   # convert/magick: crop, upscale, montage figures
+            ghostscript   # gs: rasterize/repair PDFs
+          ];
           RUST_SRC_PATH = rustPlatform.rustLibSrc;
         };
       }

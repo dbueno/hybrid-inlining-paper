@@ -1,10 +1,13 @@
 # Hybrid Inlining in Ascent Datalog
 
-> **Status: implemented.** Sections 1–5 are the original plan, kept as the
-> design record. Section 6 records what was built against each milestone,
-> section 7 the places the implementation diverged from the sketch, and
-> section 9 which risks turned out to be real. `cargo test` runs 39 tests;
-> `cargo run --example figure1` and `--example figure5` print Figures 3 and 6.
+> **Status: implemented (round-based); single-fixpoint rework planned.**
+> Sections 1–5 are the original plan, kept as the design record. Section 6
+> records what was built against each milestone, section 7 the places the
+> implementation diverged from the sketch, and section 9 which risks turned
+> out to be real. `cargo test` runs 39 tests; `cargo run --example figure1`
+> and `--example figure5` print Figures 3 and 6. **Section 10 plans the next
+> step: collapsing the round driver into one Datalog fixpoint by re-thinking
+> the adequacy check as monotone evidence-driven resolution.**
 
 Implement the paper's pointer analysis (§4.1) with Hybrid Inlining (§3.2) as an
 Ascent program layered on the existing EDB schema (`src/ir.rs`) and access-path
@@ -432,3 +435,237 @@ while building, not retreats.
   `service` in the same round. Confluent and harmless (Theorem 3.3); at
   `k = 2` the duplicates never arise and the answer is identical, which
   `a_tight_k_limit_still_gets_the_right_answer` checks.
+
+## 10. Single-fixpoint redesign — *planned*
+
+### 10.1 Why the rounds are the scalability problem
+
+`run_hybrid` rebuilds a fresh `Round` per iteration: `Round::for_program`
+clones all ~25 EDB relations, `run()` re-derives the *entire* IDB from
+scratch, and only the `Decisions` survive to the next round. Every round
+re-runs S1, rebuilds every constraint graph, re-closes `points`, and
+re-indexes everything Ascent indexes. The number of rounds is bounded by the
+number of resolution decisions in the worst case, so on a real program the
+driver is `O(#decisions × cost-of-full-derivation)` — the semi-naive
+evaluation Ascent gives us *within* a round is thrown away *between* rounds.
+
+The rounds exist for exactly one reason (§2): adequacy is a negation over
+`points` (`pt(recv) ∩ free(𝔞) = ∅`, N3), and resolving an adequate instance
+grows `points`, which the negation reads. A negation whose consequences feed
+the negated relation cannot be stratified, so the cycle was broken by hand.
+
+### 10.2 The re-think: resolution as monotone evidence, not adequacy
+
+The fix is to notice that **adequacy is a *scheduling* device, not a
+*precision* device**. `Φ_a` answers "may I dispatch *now* on what pt(recv)
+holds, or must I wait for the caller?" — but what actually gets dispatched
+is per-allocation: each `Alloc(l) ∈ pt(recv)` independently justifies the
+one callee `lookup(type(l), sig)`. Firing that rule **the moment each
+allocation appears**, at every holder, instead of waiting for the set to be
+provably complete, is:
+
+- **monotone** — the trigger is the *presence* of a tuple, not the absence
+  of one, so it lives in the same stratum as `points` and the whole cycle
+  (resolve → inline → edge → points → resolve) becomes ordinary positive
+  recursion in one SCC;
+- **sound** — an allocation in a may-points-to set genuinely may be the
+  receiver, so its target is a genuine may-callee;
+- **equally precise** — allocations only *accumulate* along the propagation
+  chain (σ renames symbolic paths but maps allocations to themselves), and
+  past the holder the paper would call adequate the set is frozen (no free
+  roots ⟹ callers add nothing). So the union of per-allocation dispatches
+  along the chain equals the dispatch set at the first adequate holder —
+  the same early-vs-late confluence Theorem 3.3 already grants us, and the
+  same duplication §7 already accepts within a round.
+
+Figure 1 under this scheme, with no rounds: `c0` at `foo` has
+`pt(slot0) = {par_1@foo}` — no allocation, nothing fires, the instance
+propagates exactly as before. `c2` at `bar1` sees `Alloc(l31)` and dispatches
+`Y.poly` there and then; the inlined `ret@Y.poly ⊇ par_1@Y.poly` lands on the
+placeholder, `points` grows, `bar1` publishes Figure 3(c) — all inside the
+one fixpoint. `Z.poly` is never dispatched for `c2`/`c4` because no rule ever
+fires without an allocation as its witness. The precision claim needs no
+negation at all for the adequate case.
+
+The `lv[v]` analogue is the same move: resolve accessor `[c]` for each
+`Const(c) ∈ pt(index)` as it appears (monotone), and `[π]` on *presence* of a
+non-constant concrete value (an `Alloc` in the index slot — today's
+`index_undecidable`, already a presence test). Only the dead-index default
+(`index_has_const` negation) disappears: an index whose pt stays empty now
+resolves to nothing instead of `[π]` — strictly more precise, and sound
+(dead code).
+
+### 10.3 The ⊤-fallback without `!adequate`
+
+The one place a genuine absence test seems to remain is `forced`: at an
+entry / uncalled procedure / the k-limit, an instance the context never pins
+must ⊤-summarize (all CHA targets). Today that is guarded by `!adequate` —
+without the guard, Figure 1's `service` would ⊤-dispatch its own pinned
+instances and re-admit `Z.poly`. Two observations dissolve it:
+
+1. **`¬can_propagate` needs no fixpoint-negation.** Its complement
+   decomposes as `stuck(p, id) = uncalled(p) ∨ entry(p) ∨ depth(id) ≥ k`:
+   `entry` is EDB, `depth ≥ k` is a condition on the tuple, and
+   `uncalled(p)` negates only `eff_direct` (S1, itself only EDB + a count
+   aggregate). All strictly below the SCC. The current code's
+   `!can_propagate` was an incidental phrasing, not a real dependency.
+
+2. **`!adequate` flips into a presence trigger.** ⊤-dispatch at a stuck
+   holder exactly when the decisive slot's pt *contains* a free-rooted path:
+
+   ```text
+   top(p, id) <-- pending(p, id), stuck(p, id), decisive_slot(id, i),
+                  points(p, critslot(id, i), Path(w)),
+                  if matches!(w.base, Param(..) | Ret(..))
+   resolve(p, id, callee) <-- top(p, id), crit_sig(id, sig), sig_target(sig, callee)
+   ```
+
+   At `service`, `pt(critslot(c4, 0)) = {Alloc(l31)}` — no free path, `top`
+   never fires, only the per-allocation rule does. In the recursion test
+   (`a_receiver_the_recursion_never_pins_falls_back_to_top`) the receiver
+   slot holds `Path(par_i@p)` at the k-limit, `top` fires, all CHA targets —
+   the same imprecision in the same place as today.
+
+**The placeholder-rooted corner.** Today `is_free_root` also counts
+`CritSlot`/`CritRet` of *unresolved* pendings, and "unresolved" is a state
+the monotone design no longer has. It splits into three cases:
+
+- Receiver pt contains `Path(critret(id2))` where `id2` is stuck **at the
+  same holder**: no rule needed. `id2` itself either alloc-dispatches or
+  ⊤-dispatches here, its callees' returns *flow* into `critret(id2)` and on
+  into the receiver slot, and the per-allocation rule dispatches `id` on the
+  values that actually arrive. This is strictly **more precise** than
+  today's rounds, which force `id` to all-CHA whenever the feeder resolves
+  in the same round-cohort. (`CritSlot(id2, j)`-rooted paths need nothing
+  either: a slot's values come from in-holder sources, which reach the
+  receiver by the same edges.)
+- Receiver pt contains `Path(critret(id2))` where `id2` **can still
+  propagate but `id` cannot** (depth mismatch at the k-limit): `id2`'s
+  resolution will happen in a caller `id` never reaches, so waiting would
+  silently drop constraints — unsound. One conservative rule closes it, with
+  a *positive* use of `can_propagate`:
+
+  ```text
+  top(p, id) <-- pending(p, id), stuck(p, id), decisive_slot(id, i),
+                 points(p, critslot(id, i), Path(w)),
+                 if let Some(id2) = w.base.crit_id(), can_propagate(p, id2)
+   ```
+
+  Coarser than the rounds only in this narrow corner (feeder under the
+  k-limit, dependent at it), which is already the paper's ⊤ zone.
+- Mutually-fed stuck instances with no allocations and no free roots
+  anywhere: nothing fires, nothing dispatches — dead code, sound, same
+  verdict as today's "empty pt(recv), adequate, dispatches nothing".
+
+### 10.4 What each of today's negations becomes
+
+| today | over | becomes |
+|-------|------|---------|
+| N1 `sig_size` count | EDB | unchanged — still a lower stratum |
+| N2 `!resolved` (propagation, `pub_root`, `root_map`, `crit_map`, nesting) | driver input | **deleted** — propagation, publication, and renaming become unconditional; resolution no longer suppresses anything, it only *adds* |
+| N3 `!blocked` → `adequate` → `dispatch` | `points` | **replaced** by the per-allocation `resolve` rule (monotone, in-SCC) |
+| `!adequate ∧ !can_propagate` → `forced` | `points` | **replaced** by `stuck` (negation over S1 only) + the presence-triggered `top` rules of §10.3 |
+| N4 `index_undecidable` / `index_has_const` | `points` | undecidable was already a presence test — moves into the SCC as-is; the dead-index `[π]` default is dropped (more precise) |
+
+`resolution`/`index_resolution`/`resolved` stop being input relations;
+`resolve(p, id, callee)` and `index_acc(p, id, acc)` are ordinary IDB in the
+SCC, and the σ_crit inlining rules (`crit_map`, the resolved-placeholder
+`edge`/`points` rules, hybrid-in-hybrid `pending` nesting) key on them
+unchanged — §7 already moved that renaming in-program, so this is a change
+of *trigger*, not of machinery. `run_hybrid` collapses to: build one
+program, `run()` once. `Decisions`, `MAX_ROUNDS`, and the driver loop are
+deleted; `Hybrid::dispatches` reads the `resolve` relation.
+
+New stratification, all checked by the macro at compile time:
+
+```text
+A   EDB + S1: sig_size (count), sig_target, mono_target, eff_direct,
+    critical, is_called                                     [agg over EDB]
+A'  uncalled(p) <-- procedure(p), !is_called(p)             [¬ over A]
+B   THE SCC — all positive: edge, points, path_used, pending, crit_*,
+    decisive_slot, pub_root, pub_edge, pub_points, root_map, crit_map,
+    can_propagate, stuck, top, resolve, index_acc
+C   reporting only, feeds nothing back: blocked, adequate, settled —
+    negation over B is legal here because C is a final stratum
+```
+
+### 10.5 Adequacy demoted from control to reporting
+
+Adequacy doesn't vanish — it stops *driving* resolution and becomes a
+read-only classification in stratum C, where negating over the finished
+`points` fixpoint is ordinary stratified negation:
+
+```text
+settled(p, id) <-- resolve(p, id, _), !blocked(p, id)
+```
+
+Two consumers need it. `placeholders()` (the "critical ⟨…⟩ deferred" lines
+of Figure 3) reports pendings that are not settled, since `pending` no
+longer shrinks on resolution. `points_to_path` filters `Path` values rooted
+at a *settled* instance's placeholder, replacing today's resolved-root
+filter, so `pt(second)` still reads `{l37}` and not
+`{l37, ⟨L25@L28·L31b·L38⟩:res}`. Both are queries over the final model —
+Rust-side or stratum C, either is correct.
+
+One honest cost: because placeholders stay published after resolution, a
+caller still creates and re-dispatches child instances of already-settled
+placeholders, and summaries carry the (settled) placeholder edges alongside
+the flowed-through constraints. This is the same confluent duplication §7
+accepted within a round, now spanning the whole run; stratum C hides it from
+reporting, but the derivation does the redundant work. It is bounded by the
+same k-limit as today, and it is the price of monotonicity.
+
+### 10.6 Expected behavioral deltas
+
+- **Figure 1, Figure 5, recursion, k = 2**: identical dispatch sets and
+  points-to verdicts (argued in §10.2–10.3; the tests are the check).
+- **`k = 0` baseline**: today ⊤-summarizes *every* critical instance;
+  the redesign still ⊤-summarizes those with free-rooted receivers (which
+  is all of Figure 1/5's, so `k_zero_reproduces_figure_2_exactly` should
+  survive) but pins an instance whose receiver is a purely local allocation.
+  If some future EDB hits that case at k = 0, the redesign is *more*
+  precise than Figure 2 there — the oracle equality is then asserted only
+  over free-receiver instances.
+- **Dead `lv[v]` indexes** resolve to nothing instead of `[π]` — more
+  precise, sound.
+- **Chained criticals** (receiver fed by another critical's return) at a
+  common stuck holder resolve from actually-flowing values instead of
+  all-CHA — more precise than today; the k-limit depth-mismatch corner of
+  §10.3 is the one place coarser than today.
+
+### 10.7 Milestones
+
+1. **Split `stuck` out of `forced`** in the current code (mechanical:
+   `uncalled` + `entry` + depth test, no `!adequate` yet) and check tests
+   still pass — isolates the risky step from the mechanical one.
+2. **The SCC**: delete N2 guards, add `resolve`/`index_acc`/`top` per
+   §10.2–10.3, re-key `crit_map` and friends on `resolve`. The macro's
+   stratification check is the first gate; `figure1` end-to-end the second.
+3. **Stratum C + query layer**: `settled`, the `placeholders()` /
+   `points_to_path` filters, `Hybrid` without `Decisions`/`rounds`.
+4. **Delete the driver.** `run_hybrid` = construct, `run()`, wrap. Update
+   doc comments that describe rounds (module header, `Round` docs).
+5. **Tests**: the 39 existing tests are the spec — expected diffs are only
+   the `Hybrid` API surface and possibly the k = 0 oracle scope (§10.6).
+   Add a chained-criticals test pinning the §10.3 precision win, and a
+   depth-mismatch test pinning the conservative corner.
+6. **Scalability payoff check**: `ascent_par!` on the single program (the
+   domain is already `Arc`-backed `Send + Sync`, §6.2), and a synthetic
+   deep-chain benchmark showing derivation cost no longer scales with
+   decision count.
+
+### 10.8 Risks
+
+- **Fixpoint size** — the redesign trades re-derivation for a larger single
+  model (settled placeholders keep publishing, children of settled instances
+  still spawn). Bounded by the same instance vocabulary as today
+  (k-bounded chains × nesting), but the constant is bigger; the benchmark in
+  milestone 6 is the empirical check.
+- **The §10.3 corner rule** — the positive `can_propagate(p, id2)` trigger
+  is conservative; if it fires in practice on real chains it can be refined
+  (e.g. only when `id2`'s feeder path is the *only* content of the decisive
+  slot is *not* expressible monotonically — any refinement must stay a
+  presence test).
+- **Path explosion** — unchanged from §9; the redesign neither helps nor
+  hurts, but a single fixpoint makes the eventual access-path depth bound
+  easier to add (one place, no cross-round interaction).

@@ -24,7 +24,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use ascent::ascent;
+use ascent::{ascent, ascent_source};
 
 /// Interned-ish string newtypes. `Arc<str>` keeps clones cheap (Ascent clones
 /// tuples freely) and keeps every column `Send + Sync`, so `ascent_par!` stays
@@ -90,11 +90,7 @@ pub type ArgIdx = usize;
 /// Position of a statement within its enclosing procedure's body.
 pub type Line = usize;
 
-ascent! {
-    /// The program under analysis, as a set of EDB relations. Populate the
-    /// public fields directly; there are no rules yet, so `run()` is a no-op.
-    pub struct Program;
-
+ascent_source! { edb:
     // ---------------------------------------------------------------------
     // Program structure
     // ---------------------------------------------------------------------
@@ -196,4 +192,15 @@ ascent! {
     /// `t` selects implementation `p` — `dispatch(a, proc)` of §4.1.1,
     /// precomputed by the front end from the type hierarchy.
     relation lookup(Type, Sig, Proc);
+}
+
+ascent! {
+    /// The program under analysis, as a set of EDB relations: the [`edb`]
+    /// schema and no rules. Populate the public fields directly.
+    ///
+    /// The analysis is a *separate* Ascent program ([`crate::analysis::Round`])
+    /// that includes the same schema, so the two cannot drift apart.
+    pub struct Program;
+
+    include_source!(crate::ir::edb);
 }

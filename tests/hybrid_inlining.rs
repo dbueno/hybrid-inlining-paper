@@ -694,3 +694,113 @@ fn an_index_that_is_not_a_constant_is_undecidable() {
         BTreeSet::from([Accessor::Index(Const::from("\"old\""))])
     );
 }
+
+// =========================================================================
+// The EDB schema is shared; the facts still have to be copied
+// =========================================================================
+
+/// `include_source!` guarantees `Program` and `Round` *declare* the same
+/// relations, but [`Round::for_program`] still copies the facts one relation
+/// at a time, and a forgotten line would leave one silently empty. So: build a
+/// program in which every EDB relation holds a tuple, and check every one of
+/// them survives the copy.
+///
+/// The facts are nonsense — this program is never run, only copied.
+#[test]
+fn every_edb_relation_is_copied_into_the_round() {
+    let mut prog = Program::default();
+
+    prog.procedure = vec![(p("q"),)];
+    prog.proc_type = vec![(p("q"), Type::from("T"))];
+    prog.proc_sig = vec![(p("q"), Sig::from("g"))];
+    prog.entry = vec![(p("q"),)];
+    prog.in_proc = vec![(Stmt::from("s"), p("q"), 0)];
+    prog.alloc = vec![(Stmt::from("s"), Var::from("x"), Alloc::from("l"))];
+    prog.alloc_type = vec![(Alloc::from("l"), Type::from("T"))];
+    prog.const_assign = vec![(Stmt::from("s"), Var::from("x"), Const::from("c"))];
+    prog.mov = vec![(Stmt::from("s"), Var::from("x"), Var::from("y"))];
+    prog.load_field = vec![(
+        Stmt::from("s"),
+        Var::from("x"),
+        Var::from("y"),
+        Field::from("f"),
+    )];
+    prog.store_field = vec![(
+        Stmt::from("s"),
+        Var::from("x"),
+        Field::from("f"),
+        Var::from("y"),
+    )];
+    prog.load_static = vec![(
+        Stmt::from("s"),
+        Var::from("x"),
+        Type::from("T"),
+        Field::from("f"),
+    )];
+    prog.store_static = vec![(
+        Stmt::from("s"),
+        Type::from("T"),
+        Field::from("f"),
+        Var::from("y"),
+    )];
+    prog.load_index_const = vec![(
+        Stmt::from("s"),
+        Var::from("x"),
+        Var::from("y"),
+        Const::from("c"),
+    )];
+    prog.store_index_const = vec![(
+        Stmt::from("s"),
+        Var::from("x"),
+        Const::from("c"),
+        Var::from("y"),
+    )];
+    prog.load_index_var = vec![(
+        Stmt::from("s"),
+        Var::from("x"),
+        Var::from("y"),
+        Var::from("i"),
+    )];
+    prog.store_index_var = vec![(
+        Stmt::from("s"),
+        Var::from("x"),
+        Var::from("i"),
+        Var::from("y"),
+    )];
+    prog.direct_call = vec![(Stmt::from("s"), p("q"))];
+    prog.virtual_call = vec![(Stmt::from("s"), Var::from("x"), Sig::from("g"))];
+    prog.actual_arg = vec![(Stmt::from("s"), 0, Var::from("x"))];
+    prog.bind_ret = vec![(Stmt::from("s"), Var::from("x"))];
+    prog.formal = vec![(p("q"), 0, Var::from("x"))];
+    prog.ret = vec![(p("q"), Var::from("x"))];
+    prog.direct_subtype = vec![(Type::from("T"), Type::from("U"))];
+    prog.lookup = vec![(Type::from("T"), Sig::from("g"), p("q"))];
+
+    fn sizes(summary: &str) -> BTreeMap<&str, usize> {
+        summary
+            .lines()
+            .filter_map(|line| line.split_once(" size: "))
+            .map(|(name, n)| (name.trim(), n.trim().parse().unwrap()))
+            .collect()
+    }
+
+    let round = Round::for_program(&prog, 4, &Decisions::default());
+    let (declared, copied) = (
+        prog.relation_sizes_summary(),
+        round.relation_sizes_summary(),
+    );
+    let (declared, copied) = (sizes(&declared), sizes(&copied));
+
+    assert_eq!(
+        declared.len(),
+        25,
+        "the edb schema changed; update this test"
+    );
+    for (name, n) in &declared {
+        assert_eq!(
+            copied.get(name),
+            Some(n),
+            "{name} is in the shared schema but Round::for_program does not copy it"
+        );
+    }
+}

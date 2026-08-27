@@ -55,29 +55,11 @@ ascent! {
     pub struct Round;
 
     // =====================================================================
-    // EDB — copied verbatim from `ir::Program` by `Round::for_program`.
+    // EDB — the schema of `ir::Program`, included from the same source so the
+    // two programs cannot drift apart. `Round::for_program` copies the facts.
     // =====================================================================
 
-    relation procedure(Proc);
-    relation entry(Proc);
-    relation in_proc(Stmt, Proc, Line);
-    relation alloc(Stmt, Var, Alloc);
-    relation alloc_type(Alloc, Type);
-    relation const_assign(Stmt, Var, Const);
-    relation mov(Stmt, Var, Var);
-    relation load_field(Stmt, Var, Var, Field);
-    relation store_field(Stmt, Var, Field, Var);
-    relation load_index_const(Stmt, Var, Var, Const);
-    relation store_index_const(Stmt, Var, Const, Var);
-    relation load_index_var(Stmt, Var, Var, Var);
-    relation store_index_var(Stmt, Var, Var, Var);
-    relation direct_call(Stmt, Proc);
-    relation virtual_call(Stmt, Var, Sig);
-    relation actual_arg(Stmt, ArgIdx, Var);
-    relation bind_ret(Stmt, Var);
-    relation formal(Proc, ArgIdx, Var);
-    relation ret(Proc, Var);
-    relation lookup(Type, Sig, Proc);
+    include_source!(crate::ir::edb);
 
     // =====================================================================
     // Driver-fed inputs. These are what carries information between rounds,
@@ -553,7 +535,11 @@ impl Round {
     pub fn for_program(prog: &Program, k: usize, decided: &Decisions) -> Round {
         let mut r = Round::default();
 
+        // Every relation of the shared `edb` schema, in declaration order.
+        // `edb_relation_counts_match` keeps this list from falling behind.
         r.procedure = prog.procedure.clone();
+        r.proc_type = prog.proc_type.clone();
+        r.proc_sig = prog.proc_sig.clone();
         r.entry = prog.entry.clone();
         r.in_proc = prog.in_proc.clone();
         r.alloc = prog.alloc.clone();
@@ -562,6 +548,8 @@ impl Round {
         r.mov = prog.mov.clone();
         r.load_field = prog.load_field.clone();
         r.store_field = prog.store_field.clone();
+        r.load_static = prog.load_static.clone();
+        r.store_static = prog.store_static.clone();
         r.load_index_const = prog.load_index_const.clone();
         r.store_index_const = prog.store_index_const.clone();
         r.load_index_var = prog.load_index_var.clone();
@@ -572,6 +560,7 @@ impl Round {
         r.bind_ret = prog.bind_ret.clone();
         r.formal = prog.formal.clone();
         r.ret = prog.ret.clone();
+        r.direct_subtype = prog.direct_subtype.clone();
         r.lookup = prog.lookup.clone();
 
         r.k_limit = vec![(k,)];

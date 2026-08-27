@@ -3,7 +3,7 @@
 > **Status: implemented.** Sections 1–5 are the original plan, kept as the
 > design record. Section 6 records what was built against each milestone,
 > section 7 the places the implementation diverged from the sketch, and
-> section 9 which risks turned out to be real. `cargo test` runs 38 tests;
+> section 9 which risks turned out to be real. `cargo test` runs 39 tests;
 > `cargo run --example figure1` and `--example figure5` print Figures 3 and 6.
 
 Implement the paper's pointer analysis (§4.1) with Hybrid Inlining (§3.2) as an
@@ -284,7 +284,7 @@ regression oracle already in the repo.
 
 ## 6. Milestones — **all done**
 
-Status as implemented. `cargo test` (38 tests) and both examples pass;
+Status as implemented. `cargo test` (39 tests) and both examples pass;
 `cargo clippy --all-targets` is clean.
 
 1. **Ascent spike** — ✅ done and discarded. Ascent 0.8 accepts everything the
@@ -374,6 +374,15 @@ while building, not retreats.
   handled at the CHA level by `sig_size(sig, 1) ⟹ mono_target`, which makes
   such a site non-critical from the start. Narrowing by a path's *declared*
   type is not modelled, so that case is CHA-only.
+- **One schema, two Ascent programs.** `ir::Program` had become a pure data
+  container — nothing called its `run()` — while `Round` re-declared all of
+  its relations by hand. The EDB now lives in a single `ascent_source! { edb:
+  … }` in `src/ir.rs` that both programs `include_source!`, so the schema
+  cannot drift. `Round::for_program` still copies the facts relation by
+  relation, which is the one thing sharing cannot fix; a test builds a program
+  with every relation populated and compares `relation_sizes_summary()` across
+  the copy, so a dropped line fails loudly instead of leaving a relation
+  silently empty.
 - **A decisive slot per kind of critical statement.** `blocked` intersects
   `free(𝔞)` with operand 0 for a virtual call (the receiver) and operand 1 for
   an `lv[v]` access (the index), via `decisive_slot`.
@@ -384,6 +393,10 @@ while building, not retreats.
 
 ## 8. Files
 
+- `src/ir.rs` — the EDB schema as an `ascent_source!`, plus the `Program`
+  struct that includes it. Five relations (`proc_type`, `proc_sig`,
+  `direct_subtype`, `load_static`, `store_static`) are declared and copied but
+  read by no rule yet.
 - `src/access_path.rs` — `Base::{CritSlot, CritRet}`, `CritId`, `PtVal`,
   path rebasing/extension. 8 unit tests.
 - `src/analysis.rs` — the `ascent!` program `Round`, the `Decisions` the
@@ -392,7 +405,7 @@ while building, not retreats.
   `figure2_summaries()` as the context-insensitive oracle. Moved out of
   `examples/` so `cargo test` actually runs their sanity tests, which it did
   not before.
-- `tests/hybrid_inlining.rs` — 22 end-to-end tests.
+- `tests/hybrid_inlining.rs` — 23 end-to-end tests.
 - `examples/figure1.rs`, `examples/figure5.rs` — the runners.
 
 ## 9. Risks, resolved and remaining

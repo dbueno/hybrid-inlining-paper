@@ -48,6 +48,9 @@
 //! entry procedure; the interesting statement is `L25`, the virtual call whose
 //! callee is only pinned down once the context fixes `tx`'s type.
 
+use std::collections::BTreeMap;
+
+use hybrid_inlining_poc::access_path::{AccessPath, Base, Constraint, Summary};
 use hybrid_inlining_poc::ir::*;
 
 fn p(x: &str) -> Proc {
@@ -218,10 +221,84 @@ fn figure1() -> Program {
     prog
 }
 
+/// The summaries a compositional, context-insensitive pointer analysis
+/// computes for Figure 1's procedures — the paper's Figure 2 — written as
+/// access-path constraints rooted at symbolic variables (`par_i@p`,
+/// `ret@p`).
+///
+/// Figure 1 has no field or index accesses, so every path here is a bare
+/// symbolic root; paths with `.f`/`[c]`/`[π]` suffixes are exercised in the
+/// `access_path` module's tests. The imprecision the paper is after is
+/// visible in `foo`/`mid`/`bar1`/`bar2`: inlining both `poly`
+/// implementations makes every summary say the result may be *either* the
+/// argument or `l14`, which is why `service()`'s assertions can't be
+/// verified without Hybrid Inlining.
+fn figure2_summaries() -> BTreeMap<Proc, Summary> {
+    let ret = AccessPath::ret;
+    let par = AccessPath::param;
+    let l14 = || Alloc::from("l14");
+
+    let mut summaries = BTreeMap::new();
+
+    // Figure 2(b): id() is an identity procedure. The locals tv and x have
+    // been transitively eliminated, leaving only symbolic roots.
+    summaries.insert(
+        p("FacadeImpl.id"),
+        Summary::from([Constraint::Path(ret("FacadeImpl.id"), par("FacadeImpl.id", 1))]),
+    );
+
+    // Figure 2(c): Y.poly returns its argument.
+    summaries.insert(
+        p("Y.poly"),
+        Summary::from([Constraint::Path(ret("Y.poly"), par("Y.poly", 1))]),
+    );
+
+    // Figure 2(d): Z.poly returns a fresh Obj allocated at l14.
+    summaries.insert(
+        p("Z.poly"),
+        Summary::from([Constraint::Alloc(ret("Z.poly"), l14())]),
+    );
+
+    // Figure 2(e): summarizing foo() inlines *both* poly implementations at
+    // L25, since tx's type is unknown without a context; mid() inherits the
+    // same imprecision.
+    for q in ["FacadeImpl.foo", "FacadeImpl.mid"] {
+        summaries.insert(
+            p(q),
+            Summary::from([
+                Constraint::Path(ret(q), par(q, 2)),
+                Constraint::Alloc(ret(q), l14()),
+            ]),
+        );
+    }
+
+    // Figure 2(f): bar1() pins the receiver to Y (and bar2() to Z), but the
+    // context-insensitive summaries of mid() have already merged the two
+    // callees, so both still admit both results.
+    for q in ["FacadeImpl.bar1", "FacadeImpl.bar2"] {
+        summaries.insert(
+            p(q),
+            Summary::from([
+                Constraint::Path(ret(q), par(q, 1)),
+                Constraint::Alloc(ret(q), l14()),
+            ]),
+        );
+    }
+
+    summaries
+}
+
 fn main() {
     let mut prog = figure1();
     prog.run();
     println!("{}", prog.relation_sizes_summary());
+
+    println!("\nFigure 2 summaries (compositional, context-insensitive):");
+    for (proc_, summary) in figure2_summaries() {
+        for constraint in &summary {
+            println!("  {proc_}: {constraint}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -274,6 +351,60 @@ mod tests {
             .map(|(_, _, p)| p.to_string())
             .collect();
         assert_eq!(targets, vec!["Y.poly", "Z.poly"]);
+    }
+
+    #[test]
+    fn summary_paths_are_rooted_at_symbolic_variables() {
+        // Published summaries have had their locals eliminated (§2.1), so
+        // every path is rooted at a par_i@p or ret@p, never a Base::Var.
+        for (owner, summary) in figure2_summaries() {
+            for constraint in &summary {
+                for path in constraint.paths() {
+                    assert!(
+                        !matches!(path.base, Base::Var(_)),
+                        "local root in summary of {owner}: {constraint}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn summary_roots_exist_in_the_edb() {
+        let prog = figure1();
+        let procs: HashSet<&Proc> = prog.procedure.iter().map(|(p,)| p).collect();
+        let sites: HashSet<&Alloc> = prog.alloc.iter().map(|(_, _, l)| l).collect();
+        for (owner, summary) in figure2_summaries() {
+            assert!(procs.contains(&owner), "summary for unknown proc {owner}");
+            for constraint in &summary {
+                for path in constraint.paths() {
+                    match &path.base {
+                        Base::Param(q, i) => assert!(
+                            prog.formal.iter().any(|(fp, fi, _)| fp == q && fi == i),
+                            "{path} names a formal the EDB lacks"
+                        ),
+                        Base::Ret(q) => assert!(
+                            prog.ret.iter().any(|(rp, _)| rp == q),
+                            "{path} names a return the EDB lacks"
+                        ),
+                        Base::Var(_) => unreachable!(),
+                    }
+                }
+                if let Constraint::Alloc(_, site) = constraint {
+                    assert!(sites.contains(site), "unknown allocation site {site}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn id_summary_matches_figure_2b() {
+        let summaries = figure2_summaries();
+        let rendered: Vec<String> = summaries[&p("FacadeImpl.id")]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(rendered, ["ret@FacadeImpl.id ⊇ par_1@FacadeImpl.id"]);
     }
 
     #[test]

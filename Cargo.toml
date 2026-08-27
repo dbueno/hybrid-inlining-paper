@@ -1,5 +1,5 @@
 [package]
-name = "hybrid-inlining-poc"
+name = "hybrid-inlining-paper"
 version = "0.1.0"
 edition = "2024"
 

@@ -6,8 +6,8 @@
 //! unbounded. Only propagating the access into `build`, where the constants
 //! live, resolves it.
 
-use hybrid_inlining_poc::analysis::{HybridAnalysis, render_summary, run_hybrid};
-use hybrid_inlining_poc::figure5;
+use hybrid_inlining_paper::analysis::{HybridAnalysis, render_summary, run_hybrid};
+use hybrid_inlining_paper::figure5;
 
 fn report(label: &str, h: &HybridAnalysis) {
     println!("\n=== {label} ===");

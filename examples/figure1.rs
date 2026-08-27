@@ -1,6 +1,6 @@
 //! Run Hybrid Inlining on Figure 1 and print what it derives.
 //!
-//! The program itself lives in [`hybrid_inlining_poc::figure1`]. This example
+//! The program itself lives in [`hybrid_inlining_paper::figure1`]. This example
 //! runs the analysis twice:
 //!
 //! - with `k = 0`, which forbids propagation and so forces every critical
@@ -11,10 +11,10 @@
 
 use std::collections::BTreeSet;
 
-use hybrid_inlining_poc::access_path::PtVal;
-use hybrid_inlining_poc::analysis::{HybridAnalysis, render_summary, run_hybrid};
-use hybrid_inlining_poc::figure1;
-use hybrid_inlining_poc::ir::{Proc, Var};
+use hybrid_inlining_paper::access_path::PtVal;
+use hybrid_inlining_paper::analysis::{HybridAnalysis, render_summary, run_hybrid};
+use hybrid_inlining_paper::figure1;
+use hybrid_inlining_paper::ir::{Proc, Var};
 
 fn report(label: &str, h: &HybridAnalysis) {
     println!("\n=== {label} ===");

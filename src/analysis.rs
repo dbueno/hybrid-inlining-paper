@@ -93,7 +93,7 @@ ascent_source! { hybrid_rules:
     /// and for all at the CHA level.
     relation mono_target(Stmt, Proc);
     mono_target(s.clone(), p.clone()) <--
-        virtual_call(s, _, sig), sig_size(sig, n), if *n == 1, sig_target(sig, p);
+        virtual_call(s, _, sig), sig_size(sig, 1), sig_target(sig, p);
 
     /// Callsites whose callee is statically known, and so may be summarized
     /// and inlined outright.
@@ -193,8 +193,7 @@ ascent_source! { hybrid_rules:
 
     edge(p.clone(), sup2.clone(), sub.extend(rest)) <--
         edge(p, sup, sub),
-        let sup_base = sup.base.clone(),
-        path_used(p, sup_base, sup2),
+        path_used(p, sup.base, sup2),
         if let Some(rest) = sup2.strip_prefix(sup),
         if !rest.is_empty();
     // The same congruence triggered from the other side: `ret@build ⊇ v` and
@@ -202,8 +201,7 @@ ascent_source! { hybrid_rules:
     // which is how a store through a local reaches the published summary.
     edge(p.clone(), sup.extend(rest), sub2.clone()) <--
         edge(p, sup, sub),
-        let sub_base = sub.base.clone(),
-        path_used(p, sub_base, sub2),
+        path_used(p, sub.base, sub2),
         if let Some(rest) = sub2.strip_prefix(sub),
         if !rest.is_empty();
 
@@ -367,12 +365,12 @@ ascent_source! { hybrid_rules:
 
     edge(q.clone(), a.rebase(ta.clone()), b.rebase(tb.clone())) <--
         eff_direct(s, p), in_proc(s, q, _), pub_edge(p, a, b),
-        let ab = a.base.clone(), root_map(s, ab, ta),
-        let bb = b.base.clone(), root_map(s, bb, tb);
+        root_map(s, a.base, ta),
+        root_map(s, b.base, tb);
 
     points(q.clone(), a.rebase(ta.clone()), v.clone()) <--
         eff_direct(s, p), in_proc(s, q, _), pub_points(p, a, v),
-        let ab = a.base.clone(), root_map(s, ab, ta);
+        root_map(s, a.base, ta);
 
     // -- resolution: monotone evidence, not adequacy -----------------------
 

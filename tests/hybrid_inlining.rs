@@ -6,10 +6,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hybrid_inlining_poc::access_path::{AccessPath, Accessor, Constraint, CritId, PtVal, Summary};
-use hybrid_inlining_poc::analysis::{HybridAnalysis, run_hybrid};
-use hybrid_inlining_poc::ir::*;
-use hybrid_inlining_poc::{figure1, figure5};
+use hybrid_inlining_paper::access_path::{AccessPath, Accessor, Constraint, CritId, PtVal, Summary};
+use hybrid_inlining_paper::analysis::{HybridAnalysis, run_hybrid};
+use hybrid_inlining_paper::ir::*;
+use hybrid_inlining_paper::{figure1, figure5};
 
 fn p(x: &str) -> Proc {
     x.into()

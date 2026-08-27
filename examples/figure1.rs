@@ -12,15 +12,15 @@
 use std::collections::BTreeSet;
 
 use hybrid_inlining_poc::access_path::PtVal;
-use hybrid_inlining_poc::analysis::{Hybrid, render_summary, run_hybrid};
+use hybrid_inlining_poc::analysis::{HybridAnalysis, render_summary, run_hybrid};
 use hybrid_inlining_poc::figure1;
 use hybrid_inlining_poc::ir::{Proc, Var};
 
-fn report(label: &str, h: &Hybrid) {
-    println!("\n=== {label} ({} rounds) ===", h.rounds);
+fn report(label: &str, h: &HybridAnalysis) {
+    println!("\n=== {label} ===");
 
-    for (proc_, summary) in h.round.summaries() {
-        let placeholders = h.round.placeholders(&proc_);
+    for (proc_, summary) in h.summaries() {
+        let placeholders = h.placeholders(&proc_);
         println!("  {proc_}:");
         for line in render_summary(&summary, &placeholders) {
             println!("    {line}");
@@ -33,8 +33,8 @@ fn report(label: &str, h: &Hybrid) {
     }
 }
 
-fn pt(h: &Hybrid, p: &Proc, v: &str) -> BTreeSet<PtVal> {
-    h.round.points_to(p, Var::from(v))
+fn pt(h: &HybridAnalysis, p: &Proc, v: &str) -> BTreeSet<PtVal> {
+    h.points_to(p, Var::from(v))
 }
 
 fn main() {

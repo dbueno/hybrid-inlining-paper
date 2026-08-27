@@ -1,13 +1,14 @@
 # Hybrid Inlining in Ascent Datalog
 
-> **Status: implemented (round-based); single-fixpoint rework planned.**
-> Sections 1–5 are the original plan, kept as the design record. Section 6
-> records what was built against each milestone, section 7 the places the
-> implementation diverged from the sketch, and section 9 which risks turned
-> out to be real. `cargo test` runs 39 tests; `cargo run --example figure1`
-> and `--example figure5` print Figures 3 and 6. **Section 10 plans the next
-> step: collapsing the round driver into one Datalog fixpoint by re-thinking
-> the adequacy check as monotone evidence-driven resolution.**
+> **Status: implemented, as a single Datalog fixpoint.**
+> Sections 1–5 are the original plan, kept as the design record; sections 2
+> and 4–5 describe the *round-based* design that section 10 replaced, so read
+> them as history. Section 6 records what was built against each milestone,
+> section 7 the places the implementation diverged from the sketch, and
+> section 9 which risks turned out to be real. Section 10 planned the
+> single-fixpoint rework and section 11 records how it landed. `cargo test`
+> runs 42 tests; `cargo run --example figure1` and `--example figure5` print
+> Figures 3 and 6.
 
 Implement the paper's pointer analysis (§4.1) with Hybrid Inlining (§3.2) as an
 Ascent program layered on the existing EDB schema (`src/ir.rs`) and access-path
@@ -402,13 +403,16 @@ while building, not retreats.
   read by no rule yet.
 - `src/access_path.rs` — `Base::{CritSlot, CritRet}`, `CritId`, `PtVal`,
   path rebasing/extension. 8 unit tests.
-- `src/analysis.rs` — the `ascent!` program `Round`, the `Decisions` the
-  driver carries between rounds, and `run_hybrid(prog, k) -> Hybrid`.
+- `src/analysis.rs` — every rule as one `ascent_source! { hybrid_rules: … }`,
+  the `ascent!` program `HybridAnalysis` that includes it, the `ascent_par!`
+  compile-check that includes the same source, and
+  `run_hybrid(prog, k) -> HybridAnalysis`. (Before §10 this was the
+  round-based `Round` plus a `Decisions` driver loop.)
 - `src/figure1.rs`, `src/figure5.rs` — the two paper programs as EDB, with
   `figure2_summaries()` as the context-insensitive oracle. Moved out of
   `examples/` so `cargo test` actually runs their sanity tests, which it did
   not before.
-- `tests/hybrid_inlining.rs` — 23 end-to-end tests.
+- `tests/hybrid_inlining.rs` — 26 end-to-end tests.
 - `examples/figure1.rs`, `examples/figure5.rs` — the runners.
 
 ## 9. Risks, resolved and remaining
@@ -436,7 +440,7 @@ while building, not retreats.
   `k = 2` the duplicates never arise and the answer is identical, which
   `a_tight_k_limit_still_gets_the_right_answer` checks.
 
-## 10. Single-fixpoint redesign — *planned*
+## 10. Single-fixpoint redesign — *implemented (see §11)*
 
 ### 10.1 Why the rounds are the scalability problem
 
@@ -669,3 +673,107 @@ same k-limit as today, and it is the price of monotonicity.
 - **Path explosion** — unchanged from §9; the redesign neither helps nor
   hurts, but a single fixpoint makes the eventual access-path depth bound
   easier to add (one place, no cross-round interaction).
+
+## 11. How §10 landed — **all six milestones done**
+
+`cargo test` runs 42 tests (16 unit + 26 end-to-end) and
+`cargo clippy --all-targets` is clean. Figures 3 and 6 come out unchanged,
+and so does every precision claim.
+
+1. **`stuck` split out of `forced`** — ✅ but the intermediate step was
+   skipped: `stuck` and `top` landed together, since `forced` had no meaning
+   left once `!adequate` was gone.
+2. **The SCC** — ✅ every N2 guard deleted; `resolve`, `index_acc` and `top`
+   added; `crit_map`, the placeholder `edge`/`points` rules and
+   hybrid-in-hybrid nesting re-keyed on `resolve`/`index_acc`. The macro
+   accepted the stratification on the first build.
+3. **Stratum C + query layer** — ✅ `settled`, and the filters it drives.
+4. **Driver deleted** — ✅ `Decisions`, `MAX_ROUNDS`, `Hybrid` and the loop
+   are gone; `run_hybrid` is construct / `run()` / return.
+5. **Tests** — ✅ the 39 existing tests are unchanged except for the API
+   surface, plus three new ones (below).
+6. **Scalability** — ✅ `ascent_par!` and a cascade benchmark (below).
+
+### 11.1 Where §10 was refined while building
+
+Three places where the sketch turned out to want a different shape. All three
+are simplifications.
+
+- **`free(𝔞)` became a relation, and `blocked` moved into the SCC.** §10.3
+  worked out, case by case, when a placeholder-rooted path in the decisive
+  slot should count as free: `Param`/`Ret` always; `CritRet(id2)` only when
+  `id2` can still propagate (the depth-mismatch corner); never when `id2` is
+  stuck at the same holder. That is exactly one relation:
+
+  ```text
+  free_root(p, Param(p,i)/Ret(p))        <-- formal / known_proc
+  free_root(p, CritSlot(id,_)/CritRet(id)) <-- can_propagate(p, id)
+  ```
+
+  With it, `blocked(p, id)` — "the decisive slot sees a `free_root`-rooted
+  path" — is a *presence* test, so it lives in the SCC, and §10.3's two `top`
+  rules collapse to one: `top(p, id) <-- blocked(p, id), stuck(p, id)`. The
+  §10.5 reporting relation `blocked` and the §10.3 trigger are then the same
+  relation rather than two notions of "free" that could disagree.
+- **`settled` needs the ⊤ case.** §10.5's `settled <-- resolve, !blocked` is
+  right for an alloc-pinned instance but wrong for a ⊤-summarized one, which
+  is blocked *by construction*. Without `settled(p, id) <-- top(p, id)` the
+  `k = 0` baseline reports every ⊤'d placeholder as still deferred and
+  `k_zero_reproduces_figure_2_exactly` fails. Three rules, one per way an
+  instance can be done.
+- **`summaries()` needs the settled filter too.** §10.5 named `placeholders()`
+  and `points_to_path`; but published summaries carry the settled
+  placeholders' edges as well, so `bar1` would publish its `⟨L25@L28·L31b⟩`
+  wiring next to Figure 3(c). Dropping constraints that mention a settled
+  placeholder restores Figure 3 exactly — the values are all still there by
+  transitivity, which is why nothing is lost.
+- **`uncalled` is over `known_proc`, not `procedure`.** `procedure` is
+  optional in practice (several tests never populate it for every callee), and
+  a missing fact would silently make an instance non-stuck. `known_proc` unions
+  `procedure` with `in_proc`, which every procedure holding a statement has.
+
+### 11.2 Behaviour, measured against §10.6
+
+- **Figure 1, Figure 5, recursion, `k = 2`, `k = 0`**: identical dispatch sets
+  and points-to verdicts, including `k_zero_reproduces_figure_2_exactly` — the
+  oracle equality survived unqualified, because every Figure 1/5 instance at
+  `k = 0` does have a free-rooted receiver, exactly as predicted.
+- **Chained criticals** (`a_chained_critical_resolves_from_what_actually_flows`):
+  the predicted precision win is real. Two criticals stuck at `main`, the
+  second's receiver fed by the first's placeholder: the rounds had to call
+  that placeholder free (the feeder was "unresolved" in the round the
+  dependent was classified in) and ⊤-summarized, admitting `Z.poly` and
+  leaking `l14`. One fixpoint resolves the feeder, lets `new Y()` flow
+  through the placeholder, and dispatches `Y.poly` alone.
+- **The depth-mismatch corner** (`a_feeder_that_outlives_the_k_limit_forces_top`):
+  pinned as conservative. At `k = 1` a dependent at the limit whose feeder is
+  not must ⊤-summarize; at `k = 2` both travel together and the imprecision
+  disappears.
+- **Dead `lv[v]` indexes** resolve to nothing instead of `[π]`, as planned.
+
+### 11.3 The scalability payoff
+
+- **`ascent_par!` stays open.** Rather than assert that in prose, the rules
+  now live in a single `ascent_source! { hybrid_rules: … }` that *two*
+  programs include: `HybridAnalysis` (via `ascent!`) and, under `#[cfg(test)]`,
+  `ParallelHybridAnalysis` (via `ascent_par!`). The parallel one is never run;
+  it exists so a build fails the day the program stops being parallelizable.
+  It compiled unchanged — the domain was already `Arc`-backed `Send + Sync`,
+  and with no driver there is nothing left to serialize between rounds.
+- **Cascade benchmark** (`a_cascade_of_decisions_is_one_fixpoint`): `n = 24`
+  critical statements chained so each one's receiver is the previous one's
+  result. Every decision unlocks exactly one more, so the round driver needed
+  `n + 1` complete re-derivations of the entire IDB; semi-naive evaluation
+  now discovers the whole cascade in one fixpoint, with one callee per site
+  and no ⊤ fan-out anywhere.
+
+### 11.4 Risks, revisited
+
+- **Fixpoint size** — the predicted cost is real but small at POC scale:
+  settled placeholders keep publishing, and `service` still spawns depth-3
+  children of instances `bar1`/`bar2` already decided. The whole suite runs in
+  ~20 ms. The `settled` filters keep it out of every report.
+- **The §10.3 corner rule** — it never fires on Figures 1 and 5, and the one
+  test that provokes it needs a deliberately tight `k`. Left as is.
+- **Path explosion** — unchanged; a single fixpoint does make an access-path
+  depth bound easier to add, since there is now exactly one place to add it.

@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hybrid_inlining_poc::access_path::{AccessPath, Accessor, Constraint, CritId, PtVal, Summary};
-use hybrid_inlining_poc::analysis::{Decisions, Hybrid, Round, run_hybrid};
+use hybrid_inlining_poc::analysis::{HybridAnalysis, run_hybrid};
 use hybrid_inlining_poc::ir::*;
 use hybrid_inlining_poc::{figure1, figure5};
 
@@ -16,9 +16,8 @@ fn p(x: &str) -> Proc {
 }
 
 /// `pt(v)` for a local of `p`, rendered for readable assertions.
-fn pt(h: &Hybrid, proc_: &str, v: &str) -> BTreeSet<String> {
-    h.round
-        .points_to(&p(proc_), Var::from(v))
+fn pt(h: &HybridAnalysis, proc_: &str, v: &str) -> BTreeSet<String> {
+    h.points_to(&p(proc_), Var::from(v))
         .iter()
         .map(ToString::to_string)
         .collect()
@@ -44,7 +43,7 @@ fn id_publishes_exactly_figure_2b() {
     // `X id(X x) { X tv = x; return tv; }` — both locals eliminated.
     let h = run_hybrid(&figure1::program(), 4);
     assert_eq!(
-        rendered(&h.round.summaries(), "FacadeImpl.id"),
+        rendered(&h.summaries(), "FacadeImpl.id"),
         ["ret@FacadeImpl.id ⊇ par_1@FacadeImpl.id"]
     );
 }
@@ -52,7 +51,7 @@ fn id_publishes_exactly_figure_2b() {
 #[test]
 fn published_summaries_never_mention_a_local() {
     let h = run_hybrid(&figure1::program(), 4);
-    for (owner, summary) in h.round.summaries() {
+    for (owner, summary) in h.summaries() {
         for constraint in &summary {
             for path in constraint.paths() {
                 assert!(
@@ -75,7 +74,7 @@ fn k_zero_reproduces_figure_2_exactly() {
     // compositional, context-insensitive analysis does. The oracle is the
     // hand-written Figure 2 already in the repo.
     let h = run_hybrid(&figure1::program(), 0);
-    assert_eq!(h.round.summaries(), figure1::figure2_summaries());
+    assert_eq!(h.summaries(), figure1::figure2_summaries());
 }
 
 #[test]
@@ -88,7 +87,7 @@ fn k_zero_top_summarizes_the_critical_call_at_its_origin() {
         "without context both implementations must be admitted"
     );
     // And nothing was deferred: the hybrid summary degenerates to a plain one.
-    assert!(h.round.placeholders(&p("FacadeImpl.foo")).is_empty());
+    assert!(h.placeholders(&p("FacadeImpl.foo")).is_empty());
 }
 
 // =========================================================================
@@ -124,7 +123,7 @@ fn foo_and_mid_defer_the_critical_call() {
     // placeholder wired to the operands it accesses, instead of inlining
     // both implementations under ⊤.
     let h = run_hybrid(&figure1::program(), 4);
-    let summaries = h.round.summaries();
+    let summaries = h.summaries();
 
     assert_eq!(
         rendered(&summaries, "FacadeImpl.foo"),
@@ -135,7 +134,7 @@ fn foo_and_mid_defer_the_critical_call() {
         ]
     );
     assert_eq!(
-        h.round.placeholders(&p("FacadeImpl.foo")),
+        h.placeholders(&p("FacadeImpl.foo")),
         BTreeSet::from([c(&[])])
     );
 
@@ -148,7 +147,7 @@ fn foo_and_mid_defer_the_critical_call() {
         ]
     );
     assert_eq!(
-        h.round.placeholders(&p("FacadeImpl.mid")),
+        h.placeholders(&p("FacadeImpl.mid")),
         BTreeSet::from([c(&["L28"])])
     );
 }
@@ -159,7 +158,7 @@ fn bar1_and_bar2_match_figures_3c_and_3f() {
     // and disappears from the summary. This is the whole point: bar1 is the
     // identity, bar2 always returns l14.
     let h = run_hybrid(&figure1::program(), 4);
-    let summaries = h.round.summaries();
+    let summaries = h.summaries();
 
     assert_eq!(
         rendered(&summaries, "FacadeImpl.bar1"),
@@ -169,8 +168,8 @@ fn bar1_and_bar2_match_figures_3c_and_3f() {
         rendered(&summaries, "FacadeImpl.bar2"),
         ["ret@FacadeImpl.bar2 ⊇ {l14}"]
     );
-    assert!(h.round.placeholders(&p("FacadeImpl.bar1")).is_empty());
-    assert!(h.round.placeholders(&p("FacadeImpl.bar2")).is_empty());
+    assert!(h.placeholders(&p("FacadeImpl.bar1")).is_empty());
+    assert!(h.placeholders(&p("FacadeImpl.bar2")).is_empty());
 }
 
 #[test]
@@ -204,7 +203,6 @@ fn the_receiver_is_what_blocks_propagation() {
     // rooted at a parameter, i.e. `pt(recv) ∩ free(𝔞) ≠ ∅`. bar1 can.
     let h = run_hybrid(&figure1::program(), 4);
     let blocked: BTreeSet<(String, String)> = h
-        .round
         .blocked
         .iter()
         .map(|(q, id)| (q.to_string(), id.to_string()))
@@ -220,12 +218,29 @@ fn the_receiver_is_what_blocks_propagation() {
 }
 
 #[test]
-fn resolution_is_the_only_feedback_between_rounds() {
-    // Figure 1 needs exactly one round of discovery plus one round to reach
-    // the fixpoint. If this ever grows, the driver is doing more work than
-    // §5 of the plan predicts.
-    assert_eq!(run_hybrid(&figure1::program(), 4).rounds, 2);
-    assert_eq!(run_hybrid(&figure1::program(), 0).rounds, 2);
+fn resolution_happens_inside_the_one_fixpoint() {
+    // There is no driver: `resolve` is ordinary IDB, derived in the same
+    // stratum as the `points` fixpoint it reads and feeds. So the callee's
+    // summary must already be inlined at the placeholder in the very model
+    // `resolve` was derived in — one `run()`, no replay.
+    let h = run_hybrid(&figure1::program(), 4);
+    let c2 = c(&["L28", "L31b"]);
+
+    assert!(
+        h.resolve
+            .contains(&(p("FacadeImpl.bar1"), c2.clone(), p("Y.poly")))
+    );
+    // σ_crit put `ret@Y.poly ⊇ par_1@Y.poly` onto the placeholder ...
+    assert!(h.edge.contains(&(
+        p("FacadeImpl.bar1"),
+        AccessPath::crit_ret(c2.clone()),
+        AccessPath::crit_slot(c2.clone(), 1),
+    )));
+    // ... and the result reached bar1's published summary in the same run.
+    assert_eq!(
+        rendered(&h.summaries(), "FacadeImpl.bar1"),
+        ["ret@FacadeImpl.bar1 ⊇ par_1@FacadeImpl.bar1"]
+    );
 }
 
 #[test]
@@ -272,18 +287,11 @@ fn a_monomorphic_virtual_call_is_devirtualized_not_deferred() {
     prog.bind_ret = vec![(Stmt::from("C1"), Var::from("r"))];
 
     let h = run_hybrid(&prog, 4);
-    assert!(
-        h.round.critical.is_empty(),
-        "single-target site is not critical"
-    );
+    assert!(h.critical.is_empty(), "single-target site is not critical");
+    assert_eq!(h.eff_direct.len(), 1, "it is an effectively direct call");
+    assert!(h.placeholders(&p("caller")).is_empty());
     assert_eq!(
-        h.round.eff_direct.len(),
-        1,
-        "it is an effectively direct call"
-    );
-    assert!(h.round.placeholders(&p("caller")).is_empty());
-    assert_eq!(
-        rendered(&h.round.summaries(), "caller"),
+        rendered(&h.summaries(), "caller"),
         ["ret@caller ⊇ par_2@caller"],
         "the callee was inlined outright"
     );
@@ -312,11 +320,11 @@ fn a_recursive_summary_is_just_a_fixpoint() {
     prog.bind_ret = vec![(Stmt::from("D1"), Var::from("t"))];
 
     let h = run_hybrid(&prog, 4);
-    assert_eq!(
-        rendered(&h.round.summaries(), "rid"),
-        ["ret@rid ⊇ par_0@rid"]
+    assert_eq!(rendered(&h.summaries(), "rid"), ["ret@rid ⊇ par_0@rid"]);
+    assert!(
+        h.pending.is_empty(),
+        "no critical statements, so nothing to defer"
     );
-    assert_eq!(h.rounds, 1, "no critical statements, so nothing to resolve");
 }
 
 /// ```text
@@ -400,11 +408,11 @@ fn the_k_limit_bounds_the_call_strings_of_a_recursive_program() {
     // push a new callsite onto the same instance forever.
     for k in 0..=4 {
         let h = run_hybrid(&recursive_program(), k);
-        for (_, id) in &h.round.pending {
+        for (_, id) in &h.pending {
             assert!(id.depth() <= k, "k = {k} but {id} has depth {}", id.depth());
         }
         assert!(
-            h.round.pending.iter().any(|(_, id)| id.depth() == k),
+            h.pending.iter().any(|(_, id)| id.depth() == k),
             "k = {k}: the recursion should reach the limit"
         );
         // Sound at every k: `o` reaches the result via the base case.
@@ -485,7 +493,7 @@ fn suffix_congruence_carries_a_store_through_an_alias() {
     // caller left in it, so the summary names both sources.
     let h = run_hybrid(&prog, 4);
     assert_eq!(
-        rendered(&h.round.summaries(), "through"),
+        rendered(&h.summaries(), "through"),
         [
             "ret@through ⊇ par_1@through.f",
             "ret@through ⊇ par_2@through"
@@ -523,13 +531,13 @@ fn a_constant_index_behaves_like_a_field() {
 
     let h = run_hybrid(&prog, 4);
     assert_eq!(
-        rendered(&h.round.summaries(), "cell"),
+        rendered(&h.summaries(), "cell"),
         ["ret@cell ⊇ par_1@cell[0]", "ret@cell ⊇ par_2@cell"],
     );
 
     // The path the value took really is `par_1@cell[0]`, not a bare root.
     let indexed = AccessPath::param("cell", 1).index("0");
-    assert!(h.round.points.iter().any(|(q, w, v)| q == &p("cell")
+    assert!(h.points.iter().any(|(q, w, v)| q == &p("cell")
         && w == &AccessPath::var("y")
         && v == &PtVal::Path(indexed.clone())));
     assert_eq!(indexed.to_string(), "par_1@cell[0]");
@@ -545,7 +553,7 @@ fn every_published_constraint_is_well_formed() {
     let prog = figure1::program();
     let sites: BTreeSet<&Alloc> = prog.alloc.iter().map(|(_, _, l)| l).collect();
 
-    for (owner, summary) in h.round.summaries() {
+    for (owner, summary) in h.summaries() {
         assert!(
             prog.procedure.iter().any(|(q,)| *q == owner),
             "summary for unknown proc {owner}"
@@ -568,7 +576,7 @@ fn getp_and_setp_defer_their_map_access() {
     // connected to `map`, `key` and `ret`. It cannot be summarized, because
     // `pt(key)` contains the free variable `par_2@getP`.
     let h = run_hybrid(&figure5::program(), 4);
-    let summaries = h.round.summaries();
+    let summaries = h.summaries();
 
     assert_eq!(
         rendered(&summaries, "getP"),
@@ -587,18 +595,17 @@ fn getp_and_setp_defer_their_map_access() {
         ]
     );
     assert_eq!(
-        h.round.placeholders(&p("getP")),
+        h.placeholders(&p("getP")),
         BTreeSet::from([CritId::origin("L2")])
     );
     assert_eq!(
-        h.round.placeholders(&p("setP")),
+        h.placeholders(&p("setP")),
         BTreeSet::from([CritId::origin("L5")])
     );
 
     // Both are blocked on the *index*, not the base — that is N4's decisive
     // operand, and it is what §4.1.3 intersects against `free(𝔞)`.
     let blocked: BTreeSet<String> = h
-        .round
         .blocked
         .iter()
         .map(|(q, id)| format!("{q}: {id}"))
@@ -615,13 +622,13 @@ fn build_is_index_and_context_sensitive() {
     let h = run_hybrid(&figure5::program(), 4);
 
     assert_eq!(
-        rendered(&h.round.summaries(), "build"),
+        rendered(&h.summaries(), "build"),
         [
             "ret@build[\"old\"] ⊇ par_1@build[\"cur\"]",
             "ret@build ⊇ {l8}",
         ]
     );
-    assert!(h.round.placeholders(&p("build")).is_empty());
+    assert!(h.placeholders(&p("build")).is_empty());
 
     assert_eq!(
         h.accessors_of(&p("build"), &CritId::origin("L2").push(&Stmt::from("L9b"))),
@@ -641,16 +648,15 @@ fn k_zero_loses_index_sensitivity_to_pi() {
     let h = run_hybrid(&figure5::program(), 0);
 
     assert_eq!(
-        rendered(&h.round.summaries(), "getP"),
+        rendered(&h.summaries(), "getP"),
         ["ret@getP ⊇ par_1@getP[π]"]
     );
     assert_eq!(
-        rendered(&h.round.summaries(), "build"),
+        rendered(&h.summaries(), "build"),
         ["ret@build[π] ⊇ par_1@build[π]", "ret@build ⊇ {l8}"]
     );
     assert!(
-        h.decisions
-            .indices
+        h.index_acc
             .iter()
             .all(|(_, _, acc)| *acc == Accessor::IndexUnknown)
     );
@@ -668,21 +674,19 @@ fn an_index_that_is_not_a_constant_is_undecidable() {
     prog.alloc_type.push((Alloc::from("lk"), Type::from("Obj")));
 
     let get = CritId::origin("L2").push(&Stmt::from("L9b"));
+    let h = run_hybrid(&prog, 4);
 
-    // Adequacy and N4 are gated on `!resolved`, so they are only visible in
-    // the round that discovers them — replay the first one to see both.
-    let mut first = Round::for_program(&prog, 4, &Decisions::default());
-    first.run();
+    // Adequacy is no longer a gate, so both classifications stay readable in
+    // the finished model rather than only in the round that discovered them.
     assert!(
-        first.adequate.contains(&(p("build"), get.clone())),
+        h.adequate.contains(&(p("build"), get.clone())),
         "no free variable reaches the index, so the context is adequate"
     );
     assert!(
-        first.index_undecidable.contains(&(p("build"), get.clone())),
+        h.index_undecidable.contains(&(p("build"), get.clone())),
         "but the index is an allocation site, so it still cannot be pinned"
     );
 
-    let h = run_hybrid(&prog, 4);
     assert_eq!(
         h.accessors_of(&p("build"), &get),
         BTreeSet::from([Accessor::IndexUnknown])
@@ -699,15 +703,15 @@ fn an_index_that_is_not_a_constant_is_undecidable() {
 // The EDB schema is shared; the facts still have to be copied
 // =========================================================================
 
-/// `include_source!` guarantees `Program` and `Round` *declare* the same
-/// relations, but [`Round::for_program`] still copies the facts one relation
-/// at a time, and a forgotten line would leave one silently empty. So: build a
-/// program in which every EDB relation holds a tuple, and check every one of
-/// them survives the copy.
+/// `include_source!` guarantees `Program` and `HybridAnalysis` *declare* the
+/// same relations, but [`HybridAnalysis::for_program`] still copies the facts
+/// one relation at a time, and a forgotten line would leave one silently
+/// empty. So: build a program in which every EDB relation holds a tuple, and
+/// check every one of them survives the copy.
 ///
 /// The facts are nonsense — this program is never run, only copied.
 #[test]
-fn every_edb_relation_is_copied_into_the_round() {
+fn every_edb_relation_is_copied_into_the_analysis() {
     let mut prog = Program::default();
 
     prog.procedure = vec![(p("q"),)];
@@ -784,10 +788,10 @@ fn every_edb_relation_is_copied_into_the_round() {
             .collect()
     }
 
-    let round = Round::for_program(&prog, 4, &Decisions::default());
+    let analysis = HybridAnalysis::for_program(&prog, 4);
     let (declared, copied) = (
         prog.relation_sizes_summary(),
-        round.relation_sizes_summary(),
+        analysis.relation_sizes_summary(),
     );
     let (declared, copied) = (sizes(&declared), sizes(&copied));
 
@@ -800,7 +804,338 @@ fn every_edb_relation_is_copied_into_the_round() {
         assert_eq!(
             copied.get(name),
             Some(n),
-            "{name} is in the shared schema but Round::for_program does not copy it"
+            "{name} is in the shared schema but HybridAnalysis::for_program does not copy it"
         );
     }
+}
+
+// =========================================================================
+// Chained criticals: what the single fixpoint buys, and where it still pays
+// =========================================================================
+
+/// ```text
+/// main() {                       // entry, and nothing calls it
+///   M1: g   = new P();
+///   M2: r   = g.get();           // critical A: get() has two CHA targets
+///   M3: o   = new Obj();
+///   M4: res = r.poly(o);         // critical B: its receiver *is* A's result
+/// }
+/// P.get()  { return new Y(); }   Q.get()  { return new Z(); }
+/// Y.poly(o){ return o; }         Z.poly(o){ return new Obj(); }  // l14
+/// ```
+///
+/// Both instances are stuck at `main`, and B's receiver is fed by A's
+/// placeholder. The round-based analysis had to treat that placeholder as
+/// part of `free(𝔞)` — "unresolved" was a state, and A was unresolved in the
+/// round B was classified in — so B was blocked, then forced, and admitted
+/// *both* `poly` implementations.
+///
+/// In one fixpoint there is no such state. A is stuck, so it will be decided
+/// here from values that are already in `main`; its placeholder is therefore
+/// not free. A pins `P.get`, `P.get`'s `new Y()` flows through the
+/// placeholder into B's receiver, and B dispatches on what actually arrives.
+#[test]
+fn a_chained_critical_resolves_from_what_actually_flows() {
+    let mut prog = Program::default();
+    prog.procedure = [
+        (p("P.get"),),
+        (p("Q.get"),),
+        (p("Y.poly"),),
+        (p("Z.poly"),),
+        (p("main"),),
+    ]
+    .to_vec();
+    prog.entry = vec![(p("main"),)];
+    prog.lookup = vec![
+        (Type::from("P"), Sig::from("get()"), p("P.get")),
+        (Type::from("Q"), Sig::from("get()"), p("Q.get")),
+        (Type::from("Y"), Sig::from("poly(Obj)"), p("Y.poly")),
+        (Type::from("Z"), Sig::from("poly(Obj)"), p("Z.poly")),
+    ];
+    prog.alloc_type = vec![
+        (Alloc::from("lp"), Type::from("P")),
+        (Alloc::from("ly"), Type::from("Y")),
+        (Alloc::from("lz"), Type::from("Z")),
+        (Alloc::from("lo"), Type::from("Obj")),
+        (Alloc::from("l14"), Type::from("Obj")),
+    ];
+
+    prog.formal = vec![
+        (p("P.get"), 0, Var::from("this@P")),
+        (p("Q.get"), 0, Var::from("this@Q")),
+        (p("Y.poly"), 0, Var::from("this@Y")),
+        (p("Y.poly"), 1, Var::from("obj@Y")),
+        (p("Z.poly"), 0, Var::from("this@Z")),
+        (p("Z.poly"), 1, Var::from("obj@Z")),
+        (p("main"), 0, Var::from("this@main")),
+    ];
+    prog.ret = vec![
+        (p("P.get"), Var::from("gy")),
+        (p("Q.get"), Var::from("gz")),
+        (p("Y.poly"), Var::from("obj@Y")),
+        (p("Z.poly"), Var::from("z14")),
+    ];
+    prog.in_proc = vec![
+        (Stmt::from("G1"), p("P.get"), 0),
+        (Stmt::from("G2"), p("Q.get"), 0),
+        (Stmt::from("Z1"), p("Z.poly"), 0),
+        (Stmt::from("M1"), p("main"), 0),
+        (Stmt::from("M2"), p("main"), 1),
+        (Stmt::from("M3"), p("main"), 2),
+        (Stmt::from("M4"), p("main"), 3),
+    ];
+    prog.alloc = vec![
+        (Stmt::from("G1"), Var::from("gy"), Alloc::from("ly")),
+        (Stmt::from("G2"), Var::from("gz"), Alloc::from("lz")),
+        (Stmt::from("Z1"), Var::from("z14"), Alloc::from("l14")),
+        (Stmt::from("M1"), Var::from("g"), Alloc::from("lp")),
+        (Stmt::from("M3"), Var::from("o"), Alloc::from("lo")),
+    ];
+    prog.virtual_call = vec![
+        (Stmt::from("M2"), Var::from("g"), Sig::from("get()")),
+        (Stmt::from("M4"), Var::from("r"), Sig::from("poly(Obj)")),
+    ];
+    prog.actual_arg = vec![
+        (Stmt::from("M2"), 0, Var::from("g")),
+        (Stmt::from("M4"), 0, Var::from("r")),
+        (Stmt::from("M4"), 1, Var::from("o")),
+    ];
+    prog.bind_ret = vec![
+        (Stmt::from("M2"), Var::from("r")),
+        (Stmt::from("M4"), Var::from("res")),
+    ];
+
+    let h = run_hybrid(&prog, 4);
+    let a = CritId::origin("M2");
+    let b = CritId::origin("M4");
+
+    assert_eq!(h.callees_of(&p("main"), &a), BTreeSet::from([p("P.get")]));
+    assert_eq!(
+        h.callees_of(&p("main"), &b),
+        BTreeSet::from([p("Y.poly")]),
+        "the feeder is stuck here too, so it is not free: no ⊤ fallback"
+    );
+    // And so `Z.poly`'s l14 never enters the answer.
+    assert_eq!(pt(&h, "main", "res"), set(&["{lo}"]));
+}
+
+/// The one corner §10.3 keeps conservative: a critical statement at the
+/// k-limit whose receiver is fed by another critical statement that is *not*
+/// at the limit.
+///
+/// ```text
+/// main()          { M1: y = new P(); M2: res = mid(y); }   // entry
+/// mid(g)          { A: a = g.get();  N: t = helper(a); return t; }
+/// helper(z)       { H1: ho = new Obj(); B: b = z.poly(ho); return b; }
+/// ```
+///
+/// At `k = 1` the `B` instance reaches `mid` at depth 1 and can go no
+/// further, while `A` originates in `mid` at depth 0 and still can. `A`'s
+/// resolution will therefore happen in `main`, a holder `B` never reaches, so
+/// `B` cannot wait for it: `A`'s placeholder counts as free, `B` is blocked,
+/// and — being stuck — it must ⊤-summarize. Raising the limit to `k = 2`
+/// lets both travel together and the imprecision disappears.
+#[test]
+fn a_feeder_that_outlives_the_k_limit_forces_top() {
+    let mut prog = Program::default();
+    prog.procedure = [
+        (p("P.get"),),
+        (p("Q.get"),),
+        (p("Y.poly"),),
+        (p("Z.poly"),),
+        (p("helper"),),
+        (p("mid"),),
+        (p("main"),),
+    ]
+    .to_vec();
+    prog.entry = vec![(p("main"),)];
+    prog.lookup = vec![
+        (Type::from("P"), Sig::from("get()"), p("P.get")),
+        (Type::from("Q"), Sig::from("get()"), p("Q.get")),
+        (Type::from("Y"), Sig::from("poly(Obj)"), p("Y.poly")),
+        (Type::from("Z"), Sig::from("poly(Obj)"), p("Z.poly")),
+    ];
+    prog.alloc_type = vec![
+        (Alloc::from("lp"), Type::from("P")),
+        (Alloc::from("ly"), Type::from("Y")),
+        (Alloc::from("lz"), Type::from("Z")),
+        (Alloc::from("lho"), Type::from("Obj")),
+        (Alloc::from("l14"), Type::from("Obj")),
+    ];
+
+    prog.formal = vec![
+        (p("P.get"), 0, Var::from("this@P")),
+        (p("Q.get"), 0, Var::from("this@Q")),
+        (p("Y.poly"), 0, Var::from("this@Y")),
+        (p("Y.poly"), 1, Var::from("obj@Y")),
+        (p("Z.poly"), 0, Var::from("this@Z")),
+        (p("Z.poly"), 1, Var::from("obj@Z")),
+        (p("helper"), 0, Var::from("this@helper")),
+        (p("helper"), 1, Var::from("z@helper")),
+        (p("mid"), 0, Var::from("this@mid")),
+        (p("mid"), 1, Var::from("g@mid")),
+        (p("main"), 0, Var::from("this@main")),
+    ];
+    prog.ret = vec![
+        (p("P.get"), Var::from("gy")),
+        (p("Q.get"), Var::from("gz")),
+        (p("Y.poly"), Var::from("obj@Y")),
+        (p("Z.poly"), Var::from("z14")),
+        (p("helper"), Var::from("b")),
+        (p("mid"), Var::from("t")),
+    ];
+    prog.in_proc = vec![
+        (Stmt::from("G1"), p("P.get"), 0),
+        (Stmt::from("G2"), p("Q.get"), 0),
+        (Stmt::from("Z1"), p("Z.poly"), 0),
+        (Stmt::from("H1"), p("helper"), 0),
+        (Stmt::from("B"), p("helper"), 1),
+        (Stmt::from("A"), p("mid"), 0),
+        (Stmt::from("N"), p("mid"), 1),
+        (Stmt::from("M1"), p("main"), 0),
+        (Stmt::from("M2"), p("main"), 1),
+    ];
+    prog.alloc = vec![
+        (Stmt::from("G1"), Var::from("gy"), Alloc::from("ly")),
+        (Stmt::from("G2"), Var::from("gz"), Alloc::from("lz")),
+        (Stmt::from("Z1"), Var::from("z14"), Alloc::from("l14")),
+        (Stmt::from("H1"), Var::from("ho"), Alloc::from("lho")),
+        (Stmt::from("M1"), Var::from("y"), Alloc::from("lp")),
+    ];
+    prog.virtual_call = vec![
+        (
+            Stmt::from("B"),
+            Var::from("z@helper"),
+            Sig::from("poly(Obj)"),
+        ),
+        (Stmt::from("A"), Var::from("g@mid"), Sig::from("get()")),
+    ];
+    prog.direct_call = vec![(Stmt::from("N"), p("helper")), (Stmt::from("M2"), p("mid"))];
+    prog.actual_arg = vec![
+        (Stmt::from("B"), 0, Var::from("z@helper")),
+        (Stmt::from("B"), 1, Var::from("ho")),
+        (Stmt::from("A"), 0, Var::from("g@mid")),
+        (Stmt::from("N"), 0, Var::from("this@mid")),
+        (Stmt::from("N"), 1, Var::from("a")),
+        (Stmt::from("M2"), 0, Var::from("this@main")),
+        (Stmt::from("M2"), 1, Var::from("y")),
+    ];
+    prog.bind_ret = vec![
+        (Stmt::from("B"), Var::from("b")),
+        (Stmt::from("A"), Var::from("a")),
+        (Stmt::from("N"), Var::from("t")),
+        (Stmt::from("M2"), Var::from("res")),
+    ];
+
+    // k = 1: B is at the limit in `mid` while its feeder A is not, so B has
+    // to give up and take every CHA target.
+    let tight = run_hybrid(&prog, 1);
+    let b_at_mid = CritId::origin("B").push(&Stmt::from("N"));
+    assert_eq!(
+        tight.callees_of(&p("mid"), &b_at_mid),
+        BTreeSet::from([p("Y.poly"), p("Z.poly")]),
+        "the depth mismatch is the one place §10.3 stays conservative"
+    );
+    assert!(tight.top.contains(&(p("mid"), b_at_mid.clone())));
+    // A itself still travels to `main` and is pinned there.
+    assert_eq!(
+        tight.callees_of(&p("main"), &CritId::origin("A").push(&Stmt::from("M2"))),
+        BTreeSet::from([p("P.get")])
+    );
+    assert_eq!(pt(&tight, "main", "res"), set(&["{l14}", "{lho}"]));
+
+    // k = 2: both instances reach `main` together, A pins the receiver, and
+    // Z.poly is never admitted.
+    let loose = run_hybrid(&prog, 2);
+    let b_at_main = b_at_mid.push(&Stmt::from("M2"));
+    assert!(loose.top.is_empty(), "nothing has to ⊤-summarize at k = 2");
+    assert_eq!(
+        loose.callees_of(&p("main"), &b_at_main),
+        BTreeSet::from([p("Y.poly")])
+    );
+    assert_eq!(pt(&loose, "main", "res"), set(&["{lho}"]));
+}
+
+// =========================================================================
+// Milestone 6: derivation cost no longer scales with the decision count
+// =========================================================================
+
+/// A cascade of `n` critical statements, each one's receiver being the
+/// previous one's result:
+///
+/// ```text
+/// main() { M0: g0 = new T0(); S0: g1 = g0.step(); ... S<n-1>: gn = ...; }
+/// T<i>.step() { A<i>: return new T<i+1>(); }        // plus a decoy D.step
+/// ```
+///
+/// Every `S<i>` can only be decided once `S<i-1>` has been, so the
+/// round-based driver needed `n + 1` complete re-derivations of the whole
+/// IDB. Resolution is now ordinary positive recursion, so one semi-naive
+/// fixpoint discovers the entire cascade.
+fn cascade_program(n: usize) -> Program {
+    let mut prog = Program::default();
+    let step = Sig::from("step()");
+
+    // A decoy implementor keeps every callsite genuinely critical: with a
+    // single CHA target the site would be devirtualized instead (N1).
+    prog.procedure.push((p("D.step"),));
+    prog.lookup
+        .push((Type::from("D"), step.clone(), p("D.step")));
+    prog.formal.push((p("D.step"), 0, Var::from("this@D")));
+
+    for i in 0..n {
+        let proc_ = p(&format!("T{i}.step"));
+        let site = Stmt::from(format!("A{i}"));
+        let result = Var::from(format!("r@T{i}"));
+        let site_alloc = Alloc::from(format!("l{}", i + 1));
+
+        prog.procedure.push((proc_.clone(),));
+        prog.lookup
+            .push((Type::from(format!("T{i}")), step.clone(), proc_.clone()));
+        prog.formal
+            .push((proc_.clone(), 0, Var::from(format!("this@T{i}"))));
+        prog.ret.push((proc_.clone(), result.clone()));
+        prog.in_proc.push((site.clone(), proc_, 0));
+        prog.alloc.push((site, result, site_alloc.clone()));
+        prog.alloc_type
+            .push((site_alloc, Type::from(format!("T{}", i + 1))));
+    }
+
+    prog.procedure.push((p("main"),));
+    prog.entry.push((p("main"),));
+    prog.formal.push((p("main"), 0, Var::from("this@main")));
+    prog.in_proc.push((Stmt::from("M0"), p("main"), 0));
+    prog.alloc
+        .push((Stmt::from("M0"), Var::from("g0"), Alloc::from("l0")));
+    prog.alloc_type.push((Alloc::from("l0"), Type::from("T0")));
+    for i in 0..n {
+        let site = Stmt::from(format!("S{i}"));
+        prog.in_proc.push((site.clone(), p("main"), i + 1));
+        prog.virtual_call
+            .push((site.clone(), Var::from(format!("g{i}")), step.clone()));
+        prog.actual_arg
+            .push((site.clone(), 0, Var::from(format!("g{i}"))));
+        prog.bind_ret.push((site, Var::from(format!("g{}", i + 1))));
+    }
+    prog
+}
+
+#[test]
+fn a_cascade_of_decisions_is_one_fixpoint() {
+    const N: usize = 24;
+    let h = run_hybrid(&cascade_program(N), 4);
+
+    for i in 0..N {
+        assert_eq!(
+            h.callees_of(&p("main"), &CritId::origin(format!("S{i}"))),
+            BTreeSet::from([p(&format!("T{i}.step"))]),
+            "S{i} should be pinned by the allocation S{} produced",
+            i.wrapping_sub(1)
+        );
+    }
+    assert_eq!(
+        h.dispatches().len(),
+        N,
+        "exactly one callee per site: no ⊤ fan-out anywhere in the cascade"
+    );
 }

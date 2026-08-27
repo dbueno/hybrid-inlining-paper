@@ -6,19 +6,19 @@
 //! unbounded. Only propagating the access into `build`, where the constants
 //! live, resolves it.
 
-use hybrid_inlining_poc::analysis::{Hybrid, render_summary, run_hybrid};
+use hybrid_inlining_poc::analysis::{HybridAnalysis, render_summary, run_hybrid};
 use hybrid_inlining_poc::figure5;
 
-fn report(label: &str, h: &Hybrid) {
-    println!("\n=== {label} ({} rounds) ===", h.rounds);
-    for (proc_, summary) in h.round.summaries() {
+fn report(label: &str, h: &HybridAnalysis) {
+    println!("\n=== {label} ===");
+    for (proc_, summary) in h.summaries() {
         println!("  {proc_}:");
-        for line in render_summary(&summary, &h.round.placeholders(&proc_)) {
+        for line in render_summary(&summary, &h.placeholders(&proc_)) {
             println!("    {line}");
         }
     }
     println!("  index accesses resolved:");
-    for (holder, id, acc) in &h.decisions.indices {
+    for (holder, id, acc) in &h.index_acc {
         println!("    in {holder}: {id} → {acc}");
     }
 }

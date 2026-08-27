@@ -1,94 +1,82 @@
 //! Hybrid Inlining (§3.2) for the compositional pointer analysis of §4.1.
 //!
-//! The analysis is a *round-based driver* around one stratified Ascent
-//! program, [`Round`]. Each round is a complete re-derivation of every
-//! procedure's summary from the EDB plus the resolutions discovered so far;
-//! the driver ([`run_hybrid`]) accumulates resolutions until a round finds
-//! nothing new.
+//! The analysis is a *single* Ascent program, [`HybridAnalysis`], evaluated to
+//! one fixpoint. [`run_hybrid`] builds it, calls `run()`, and hands it back;
+//! there is no driver and no round loop.
 //!
-//! # Why a driver, and where the negations are
+//! # Why one fixpoint, and where the negations are
 //!
-//! The paper's `ready`/`Φ_a` machinery has one genuine cycle: resolving an
-//! adequate critical statement adds constraints, which grow `pt`, which the
-//! adequacy test negates over. No single stratified program can express that,
-//! so it is broken across rounds. Everything *inside* a round is stratified,
-//! and the macro checks it at compile time:
+//! The paper's `ready`/`Φ_a` machinery looks like it has a genuine cycle
+//! through a negation: resolving an *adequate* critical statement adds
+//! constraints, which grow `pt`, which the adequacy test negates over. The
+//! way out is to notice that adequacy is a **scheduling** device, not a
+//! **precision** device. What actually gets dispatched is per-allocation:
+//! each `Alloc(l) ∈ pt(recv)` independently justifies the one callee
+//! `lookup(type(l), sig)`. Firing that rule the moment each allocation
+//! appears, at every holder, is monotone (it triggers on the *presence* of a
+//! tuple), sound (a may-points-to member genuinely may be the receiver), and
+//! no less precise (allocations only accumulate along a propagation chain,
+//! and past the first adequate holder the set is frozen — Theorem 3.3's
+//! early-vs-late confluence). So the whole cycle
+//! `resolve → inline → edge → points → resolve` is ordinary positive
+//! recursion in one strongly connected component.
+//!
+//! What is left of the negations, from the lowest stratum up — the macro
+//! checks this stratification at compile time:
 //!
 //! | stratum | relations | negation |
 //! |---------|-----------|----------|
-//! | S1 | [`Round::sig_size`], [`Round::critical`], [`Round::eff_direct`] | `count` over the EDB (N1) |
-//! | S2 | [`Round::edge`], [`Round::points`], [`Round::pending`], [`Round::pub_edge`] | `!resolved`, an input relation (N2) |
-//! | S3 | [`Round::blocked`] | — (reads the `points` fixpoint) |
-//! | S4 | [`Round::adequate`] | `!blocked` (N3) |
-//! | S5 | [`Round::forced`], [`Round::dispatch`], [`Round::resolve_out`] | `!adequate` |
+//! | A | [`HybridAnalysis::sig_size`], [`HybridAnalysis::critical`], [`HybridAnalysis::eff_direct`], [`HybridAnalysis::is_called`] | `count` over the EDB (N1) |
+//! | A′ | [`HybridAnalysis::uncalled`] | `!is_called`, over stratum A only |
+//! | B | **the SCC**: [`HybridAnalysis::edge`], [`HybridAnalysis::points`], [`HybridAnalysis::pending`], [`HybridAnalysis::pub_edge`], [`HybridAnalysis::blocked`], [`HybridAnalysis::top`], [`HybridAnalysis::resolve`], [`HybridAnalysis::index_acc`] | none — all positive |
+//! | C | [`HybridAnalysis::adequate`], [`HybridAnalysis::settled`] | `!blocked`, over the finished fixpoint |
 //!
-//! S5 feeds nothing back into S2 — the feedback goes through the driver, as
-//! the input relations [`Round::resolution`] and [`Round::resolved`] — which
-//! is exactly what keeps the round stratified.
+//! Stratum C is reporting only: it feeds nothing back, so negating over B is
+//! legal there. Adequacy has been demoted from *control* to *classification*.
+//!
+//! The one place a genuine ⊤-fallback is still needed is a placeholder that
+//! can neither be pinned nor propagated — at an entry, at a procedure with no
+//! callers, or at the k-limit. That is [`HybridAnalysis::stuck`], whose only
+//! negation (`uncalled`) is over stratum A, and it is combined with a
+//! *presence* test — [`HybridAnalysis::blocked`], "the decisive slot sees a
+//! path rooted in `free(𝔞)`" — rather than the absence test `!adequate` the
+//! round-based version used.
 //!
 //! # The constraint graph
 //!
-//! [`Round::edge`]`(p, sup, sub)` is `sup ⊇ sub` while `p` is being
-//! summarized; [`Round::points`]`(p, ω, v)` is `v ∈ pt(ω)`. Critical
+//! [`HybridAnalysis::edge`]`(p, sup, sub)` is `sup ⊇ sub` while `p` is being
+//! summarized; [`HybridAnalysis::points`]`(p, ω, v)` is `v ∈ pt(ω)`. Critical
 //! statements are *not* summarized: each pending instance contributes
 //! placeholder nodes `CritSlot(id, i)` / `CritRet(id)` that are wired to the
 //! statement's operands and result by ordinary `⊇` edges — the paper's
 //! "critical statements are connected with all the variables they access",
 //! made literal. Publishing a summary eliminates locals but keeps those
 //! placeholders, and that is what makes the summary *hybrid*.
+//!
+//! Because nothing ever *retracts* a placeholder, a resolved placeholder stays
+//! published, and a caller keeps spawning child instances of it. That
+//! duplication is confluent and harmless (Theorem 3.3), bounded by the same
+//! k-limit as everything else, and hidden from reporting by
+//! [`HybridAnalysis::settled`]; it is the price of monotonicity.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use ascent::aggregators::count;
-use ascent::ascent;
+use ascent::{ascent, ascent_source};
 
 use crate::access_path::{AccessPath, Accessor, Base, Constraint, CritId, PtVal, Summary};
 use crate::ir::{Alloc, ArgIdx, Const, Field, Line, Proc, Program, Sig, Stmt, Type, Var};
 
-ascent! {
-    /// One round of Hybrid Inlining: a stratified derivation of every
-    /// procedure's hybrid summary, given the EDB and the critical statements
-    /// resolved by previous rounds.
-    ///
-    /// Build one with [`Round::for_program`]; the driver in [`run_hybrid`]
-    /// owns the loop.
-    pub struct Round;
-
-    // =====================================================================
-    // EDB — the schema of `ir::Program`, included from the same source so the
-    // two programs cannot drift apart. `Round::for_program` copies the facts.
-    // =====================================================================
-
-    include_source!(crate::ir::edb);
-
-    // =====================================================================
-    // Driver-fed inputs. These are what carries information between rounds,
-    // and being inputs is what keeps every negation over them stratified.
-    // =====================================================================
-
+// Every rule of the analysis, as a source that `HybridAnalysis` and the
+// `parallel` compile-check both include, so the two cannot drift apart. The
+// EDB these rules read comes from `crate::ir::edb`.
+ascent_source! { hybrid_rules:
     /// The k-limit of §3.2.2, as a single tuple: a pending instance may be
     /// propagated while its call string is shorter than `k`.
     relation k_limit(usize);
 
-    /// `resolution(p, id, callee)`: a previous round decided the pending
-    /// critical statement `id`, held by `p`, may reach `callee`. The round
-    /// re-inlines `callee`'s *current* summary at the placeholder, so a
-    /// resolution keeps paying off as the callee's own summary improves.
-    relation resolution(Proc, CritId, Proc);
-
-    /// `index_resolution(p, id, acc)`: a previous round decided that the
-    /// pending `lv[v]` access `id`, held by `p`, uses accessor `acc` — either
-    /// a concrete `[c]` (one tuple per constant the index may hold) or `[π]`,
-    /// the paper's undecidable index.
-    relation index_resolution(Proc, CritId, Accessor);
-
-    /// `resolved(p, id)`: the projection of `resolution` and
-    /// `index_resolution` the negations use. Fed separately by the driver so
-    /// it is unambiguously stratum 0.
-    relation resolved(Proc, CritId);
-
     // =====================================================================
-    // S1 — criticality and CHA devirtualization (N1)
+    // Stratum A — criticality and CHA devirtualization (N1)
     // =====================================================================
 
     /// The CHA target set of a signature, deduplicated over receiver types.
@@ -100,7 +88,9 @@ ascent! {
     sig_size(sig.clone(), n) <-- virtual_call(_, _, sig), agg n = count() in sig_target(sig, _);
 
     /// A virtual call with a single CHA target is not critical: it is an
-    /// ordinary direct call the front end simply did not resolve.
+    /// ordinary direct call the front end simply did not resolve. This is
+    /// also `Φ_a`'s second disjunct, `|dispatch(proc, 𝔞)| = 1`, handled once
+    /// and for all at the CHA level.
     relation mono_target(Stmt, Proc);
     mono_target(s.clone(), p.clone()) <--
         virtual_call(s, _, sig), sig_size(sig, n), if *n == 1, sig_target(sig, p);
@@ -119,8 +109,28 @@ ascent! {
     critical(s.clone()) <-- load_index_var(s, _, _, _);
     critical(s.clone()) <-- store_index_var(s, _, _, _);
 
+    /// Every procedure the EDB names, whether or not `procedure` lists it.
+    relation known_proc(Proc);
+    known_proc(p.clone()) <-- procedure(p);
+    known_proc(p.clone()) <-- in_proc(_, p, _);
+
+    /// `is_called(p)`: some statement in the program calls `p` outright.
+    relation is_called(Proc);
+    is_called(p.clone()) <-- eff_direct(s, p), in_proc(s, _, _);
+
     // =====================================================================
-    // S2 — the monotone core
+    // Stratum A′ — the only negation below the SCC
+    // =====================================================================
+
+    /// A procedure nothing calls. Propagating a placeholder out of it would
+    /// never come back, so its pendings are [`HybridAnalysis::stuck`].
+    relation uncalled(Proc);
+    uncalled(p.clone()) <-- known_proc(p), !is_called(p);
+
+    // =====================================================================
+    // Stratum B — the SCC. Everything below here is positive, and all of it
+    // is mutually recursive: constraints grow points-to sets, which resolve
+    // critical statements, which inline summaries, which grow constraints.
     // =====================================================================
 
     /// `edge(p, sup, sub)`: the constraint `sup ⊇ sub` of `p`'s abstract
@@ -206,6 +216,11 @@ ascent! {
 
     /// `pending(p, id)`: `p`'s summary carries `id` as a placeholder — the
     /// `S` of a hybrid summary `𝔥 = (𝔠, S)`.
+    ///
+    /// Nothing removes a tuple from `pending`: resolution *adds* constraints
+    /// rather than retracting the placeholder. Use
+    /// [`HybridAnalysis::settled`] to tell a still-deferred instance from one
+    /// that has been decided.
     relation pending(Proc, CritId);
     pending(p.clone(), id.clone()) <-- crit_origin(p, _, id);
 
@@ -232,21 +247,34 @@ ascent! {
     edge(p.clone(), AccessPath::crit_slot(id.clone(), 2), AccessPath::var(from.clone())) <--
         crit_origin(p, s, id), store_index_var(s, _, _, from);
 
-    // Propagation (§3.2): an unresolved placeholder moves into the caller,
-    // where more context has accumulated. The k-limit bounds the call string
-    // so recursion terminates.
+    // Propagation (§3.2): a placeholder moves into the caller, where more
+    // context has accumulated. Unconditional — resolving an instance here no
+    // longer suppresses its child there, because "resolved" is not a state
+    // this program has. The k-limit bounds the call string so recursion
+    // terminates.
     pending(q.clone(), id.push(s)) <--
-        pending(p, id), !resolved(p, id),
+        pending(p, id),
         eff_direct(s, p), in_proc(s, q, _),
         k_limit(k), if id.depth() < *k;
 
-    /// Whether propagation is still an option. Used (negated) in S5: a
-    /// placeholder that can neither be resolved nor propagated must be
-    /// ⊤-summarized here and now, or its constraints would be dropped.
+    /// Whether propagation is still an option. Used *positively*: a
+    /// placeholder whose values may still grow in a caller is part of
+    /// `free(𝔞)`, and one that cannot propagate at all must be ⊤-summarized
+    /// where it stands.
     relation can_propagate(Proc, CritId);
     can_propagate(p.clone(), id.clone()) <--
         pending(p, id), eff_direct(s, p), in_proc(s, _, _),
         k_limit(k), if id.depth() < *k;
+
+    /// `stuck(p, id)`: nowhere left to propagate to. Its complement of
+    /// `can_propagate`, decomposed so that the only negation involved
+    /// (`uncalled`) is over stratum A rather than over the `points` fixpoint:
+    /// a procedure with no callers, an entry procedure (whose caller the
+    /// analysis cannot see), or the k-limit.
+    relation stuck(Proc, CritId);
+    stuck(p.clone(), id.clone()) <-- pending(p, id), uncalled(p);
+    stuck(p.clone(), id.clone()) <-- pending(p, id), entry(p);
+    stuck(p.clone(), id.clone()) <-- pending(p, id), k_limit(k), if id.depth() >= *k;
 
     /// The operand positions of a pending instance, and the signature it
     /// dispatches — both read off the original statement.
@@ -271,8 +299,8 @@ ascent! {
     index_crit(id.clone()) <-- store_crit(id);
 
     /// The operand whose points-to set decides the statement, and so the one
-    /// `Φ_a` intersects against `free(𝔞)`: the receiver of a virtual call,
-    /// the index of an `lv[v]` access.
+    /// `free(𝔞)` is intersected against: the receiver of a virtual call, the
+    /// index of an `lv[v]` access.
     relation decisive_slot(CritId, ArgIdx);
     decisive_slot(id.clone(), 0) <-- call_crit(id);
     decisive_slot(id.clone(), 1) <-- index_crit(id);
@@ -281,20 +309,29 @@ ascent! {
     crit_sig(id.clone(), sig.clone()) <--
         pending(_, id), let s = id.stmt.clone(), virtual_call(s, _, sig);
 
-    // -- publication: local elimination (§2.1), placeholders retained ------
+    // -- free(𝔞) and the published vocabulary ------------------------------
+
+    /// `free(𝔞)` of §4.1.3: the roots whose values a *caller* can still
+    /// change. `par_i@p` and `ret@p` always qualify. A placeholder qualifies
+    /// only while its own instance can still propagate — once it is stuck, it
+    /// will be decided here, from values that are already in this procedure,
+    /// so it is no longer something the outside can influence.
+    relation free_root(Proc, Base);
+    free_root(p.clone(), Base::Param(p.clone(), *i)) <-- formal(p, i, _);
+    free_root(p.clone(), Base::Ret(p.clone())) <-- known_proc(p);
+    free_root(p.clone(), Base::CritSlot(id.clone(), *i)) <--
+        can_propagate(p, id), crit_operand(id, i);
+    free_root(p.clone(), Base::CritRet(id.clone())) <-- can_propagate(p, id);
 
     /// The published vocabulary of `p`: its symbolic variables, plus the
-    /// placeholder nodes of its *unresolved* pendings (N2). Once resolved, a
-    /// placeholder demotes to a local and is eliminated like any other.
-    ///
-    /// This is also `free(𝔞)` — the paths accessible outside `p`, which is
-    /// what §4.1.3's adequacy predicate intersects `pt(recv)` against.
+    /// placeholder nodes of *every* pending it holds. Unlike `free_root`,
+    /// this does not shrink when an instance is decided — the placeholder
+    /// keeps carrying the constraints that were wired to it.
     relation pub_root(Proc, Base);
     pub_root(p.clone(), Base::Param(p.clone(), *i)) <-- formal(p, i, _);
-    pub_root(p.clone(), Base::Ret(p.clone())) <-- procedure(p);
-    pub_root(p.clone(), Base::CritRet(id.clone())) <-- pending(p, id), !resolved(p, id);
-    pub_root(p.clone(), Base::CritSlot(id.clone(), *i)) <--
-        pending(p, id), !resolved(p, id), crit_operand(id, i);
+    pub_root(p.clone(), Base::Ret(p.clone())) <-- known_proc(p);
+    pub_root(p.clone(), Base::CritRet(id.clone())) <-- pending(p, id);
+    pub_root(p.clone(), Base::CritSlot(id.clone(), *i)) <-- pending(p, id), crit_operand(id, i);
 
     /// `pub_edge(p, a, b)`: the constraint `a ⊇ b` of `p`'s published
     /// summary. Transitivity through locals has already happened inside
@@ -322,10 +359,10 @@ ascent! {
         eff_direct(s, p), bind_ret(s, r);
     // A placeholder is renamed rather than resolved — this *is* propagation.
     root_map(s.clone(), Base::CritSlot(id.clone(), *i), Base::CritSlot(id.push(s), *i)) <--
-        eff_direct(s, p), pending(p, id), !resolved(p, id), crit_operand(id, i),
+        eff_direct(s, p), pending(p, id), crit_operand(id, i),
         k_limit(k), if id.depth() < *k;
     root_map(s.clone(), Base::CritRet(id.clone()), Base::CritRet(id.push(s))) <--
-        eff_direct(s, p), pending(p, id), !resolved(p, id),
+        eff_direct(s, p), pending(p, id),
         k_limit(k), if id.depth() < *k;
 
     edge(q.clone(), a.rebase(ta.clone()), b.rebase(tb.clone())) <--
@@ -337,7 +374,68 @@ ascent! {
         eff_direct(s, p), in_proc(s, q, _), pub_points(p, a, v),
         let ab = a.base.clone(), root_map(s, ab, ta);
 
-    // -- inlining a summary at a *resolved* critical statement -------------
+    // -- resolution: monotone evidence, not adequacy -----------------------
+
+    /// `blocked(p, id)`: `pt(decisive slot) ∩ free(𝔞) ≠ ∅`. Something the
+    /// outside still controls may reach the operand that decides this
+    /// statement.
+    ///
+    /// This is a *presence* test, so unlike the round-based version it lives
+    /// in the SCC and can drive [`HybridAnalysis::top`] directly.
+    relation blocked(Proc, CritId);
+    blocked(p.clone(), id.clone()) <--
+        pending(p, id), decisive_slot(id, i),
+        let decisive = AccessPath::crit_slot(id.clone(), *i),
+        points(p, decisive, ?PtVal::Path(w)),
+        let wb = w.base.clone(), free_root(p, wb);
+
+    /// `top(p, id)`: the instance must be ⊤-summarized here and now. It is
+    /// blocked — the context never pins it — and there is nowhere left to
+    /// propagate to, so deferring would silently drop constraints.
+    ///
+    /// This replaces the round-based `forced`, and with it the `!adequate`
+    /// negation over the `points` fixpoint.
+    relation top(Proc, CritId);
+    top(p.clone(), id.clone()) <-- blocked(p, id), stuck(p, id);
+
+    /// `resolve(p, id, callee)`: an implementation this instance may reach.
+    ///
+    /// The first rule is the whole re-think: one allocation in the receiver's
+    /// points-to set is already enough evidence for the one callee it selects,
+    /// so it fires as soon as the allocation appears, without waiting for the
+    /// set to be provably complete. The second is the ⊤ fallback.
+    relation resolve(Proc, CritId, Proc);
+    resolve(p.clone(), id.clone(), callee.clone()) <--
+        pending(p, id), call_crit(id),
+        let recv = AccessPath::crit_slot(id.clone(), 0),
+        points(p, recv, ?PtVal::Alloc(l)),
+        alloc_type(l, t), crit_sig(id, sig), lookup(t, sig, callee);
+    resolve(p.clone(), id.clone(), callee.clone()) <--
+        top(p, id), call_crit(id), crit_sig(id, sig), sig_target(sig, callee);
+
+    /// N4, the `lv[v]` analogue (Figure 4, definition (5)): the index holds a
+    /// concrete value that is not a constant, so it cannot be pinned and
+    /// `[π]` must be used. A *path* in the index does not count — that is the
+    /// caller's business, and the instance simply propagates.
+    relation index_undecidable(Proc, CritId);
+    index_undecidable(p.clone(), id.clone()) <--
+        pending(p, id), index_crit(id),
+        let index = AccessPath::crit_slot(id.clone(), 1),
+        points(p, index, ?PtVal::Alloc(_));
+
+    /// The accessor an `lv[v]` access resolves to: one tuple per constant the
+    /// index may hold — again on presence, as each constant appears — or the
+    /// undecidable `[π]`. An index whose points-to set stays empty resolves
+    /// to nothing at all: dead code, and more precise than defaulting to π.
+    relation index_acc(Proc, CritId, Accessor);
+    index_acc(p.clone(), id.clone(), Accessor::Index(c.clone())) <--
+        pending(p, id), index_crit(id),
+        let index = AccessPath::crit_slot(id.clone(), 1),
+        points(p, index, ?PtVal::Const(c));
+    index_acc(p.clone(), id.clone(), Accessor::IndexUnknown) <-- index_undecidable(p, id);
+    index_acc(p.clone(), id.clone(), Accessor::IndexUnknown) <-- top(p, id), index_crit(id);
+
+    // -- inlining a summary at a resolved critical statement ---------------
 
     /// `crit_map(p, id, from, to)`: the substitution σ_crit for a resolution.
     /// The callee's formals land on the placeholder's operand slots and its
@@ -345,28 +443,28 @@ ascent! {
     /// already wired to the placeholder connect straight through.
     relation crit_map(Proc, CritId, Base, Base);
     crit_map(p.clone(), id.clone(), Base::Param(callee.clone(), *i), Base::CritSlot(id.clone(), *i)) <--
-        resolution(p, id, callee), formal(callee, i, _);
+        resolve(p, id, callee), formal(callee, i, _);
     crit_map(p.clone(), id.clone(), Base::Ret(callee.clone()), Base::CritRet(id.clone())) <--
-        resolution(p, id, callee);
+        resolve(p, id, callee);
     // Hybrid-in-hybrid: the callee's own placeholders are renamed into `p`.
     crit_map(p.clone(), id.clone(), Base::CritSlot(id2.clone(), *j), Base::CritSlot(id2.nest(id), *j)) <--
-        resolution(p, id, callee), pending(callee, id2), !resolved(callee, id2),
+        resolve(p, id, callee), pending(callee, id2),
         crit_operand(id2, j), k_limit(k), if id2.nest_depth(id) <= *k;
     crit_map(p.clone(), id.clone(), Base::CritRet(id2.clone()), Base::CritRet(id2.nest(id))) <--
-        resolution(p, id, callee), pending(callee, id2), !resolved(callee, id2),
+        resolve(p, id, callee), pending(callee, id2),
         k_limit(k), if id2.nest_depth(id) <= *k;
 
     pending(p.clone(), id2.nest(id)) <--
-        resolution(p, id, callee), pending(callee, id2), !resolved(callee, id2),
+        resolve(p, id, callee), pending(callee, id2),
         k_limit(k), if id2.nest_depth(id) <= *k;
 
     edge(p.clone(), a.rebase(ta.clone()), b.rebase(tb.clone())) <--
-        resolution(p, id, callee), pub_edge(callee, a, b),
+        resolve(p, id, callee), pub_edge(callee, a, b),
         let ab = a.base.clone(), crit_map(p, id, ab, ta),
         let bb = b.base.clone(), crit_map(p, id, bb, tb);
 
     points(p.clone(), a.rebase(ta.clone()), v.clone()) <--
-        resolution(p, id, callee), pub_points(callee, a, v),
+        resolve(p, id, callee), pub_points(callee, a, v),
         let ab = a.base.clone(), crit_map(p, id, ab, ta);
 
     // -- resolving an lv[v] access ----------------------------------------
@@ -376,12 +474,12 @@ ascent! {
     // Suffix congruence then carries `ω[c]` down to whatever `ω` stands for,
     // which is what makes the result index-sensitive in the caller.
     edge(p.clone(), AccessPath::crit_ret(id.clone()), w.extend(std::slice::from_ref(acc))) <--
-        index_resolution(p, id, acc), load_crit(id),
+        index_acc(p, id, acc), load_crit(id),
         let slot = AccessPath::crit_slot(id.clone(), 0),
         edge(p, slot, w);
 
     edge(p.clone(), w.extend(std::slice::from_ref(acc)), AccessPath::crit_slot(id.clone(), 2)) <--
-        index_resolution(p, id, acc), store_crit(id),
+        index_acc(p, id, acc), store_crit(id),
         let slot = AccessPath::crit_slot(id.clone(), 0),
         edge(p, slot, w);
 
@@ -391,152 +489,64 @@ ascent! {
     // `setP`'s write to `map[key]` would never reach `par_1@setP[c]` and the
     // caller would not see it at all.
     edge(p.clone(), AccessPath::crit_ret(id.clone()), w.extend(std::slice::from_ref(acc))) <--
-        index_resolution(p, id, acc), load_crit(id),
+        index_acc(p, id, acc), load_crit(id),
         let slot = AccessPath::crit_slot(id.clone(), 0),
         points(p, slot, ?PtVal::Path(w));
 
     edge(p.clone(), w.extend(std::slice::from_ref(acc)), AccessPath::crit_slot(id.clone(), 2)) <--
-        index_resolution(p, id, acc), store_crit(id),
+        index_acc(p, id, acc), store_crit(id),
         let slot = AccessPath::crit_slot(id.clone(), 0),
         points(p, slot, ?PtVal::Path(w));
 
     // =====================================================================
-    // S3 — where a context is *not* adequate (reads the `points` fixpoint)
+    // Stratum C — reporting. Negation over the finished fixpoint is ordinary
+    // stratified negation here, because nothing below reads these.
     // =====================================================================
 
-    /// `blocked(p, id)`: `pt(recv) ∩ free(𝔞) ≠ ∅`. The receiver slot may hold
-    /// something rooted outside `p`, so a caller can still change which
-    /// implementation this call dispatches to: keep propagating.
-    relation blocked(Proc, CritId);
-    blocked(p.clone(), id.clone()) <--
-        pending(p, id), !resolved(p, id), decisive_slot(id, i),
-        let decisive = AccessPath::crit_slot(id.clone(), *i),
-        points(p, decisive, ?PtVal::Path(w)),
-        let wb = w.base.clone(), pub_root(p, wb);
-
-    /// N4, the `lv[v]` analogue of adequacy (Figure 4, definition (5)): the
-    /// index is decidable only if its points-to set is *all* constants.
-    /// Anything else — an allocation site, a path the caller still owns —
-    /// means the index cannot be pinned, and `[π]` must be used.
-    relation index_undecidable(Proc, CritId);
-    index_undecidable(p.clone(), id.clone()) <--
-        pending(p, id), !resolved(p, id), index_crit(id),
-        let index = AccessPath::crit_slot(id.clone(), 1),
-        points(p, index, v), if !matches!(v, PtVal::Const(_));
-
-    /// Whether the index has any constant at all; an index with an empty
-    /// points-to set is dead, and gets `[π]` rather than lingering forever.
-    relation index_has_const(Proc, CritId);
-    index_has_const(p.clone(), id.clone()) <--
-        pending(p, id), index_crit(id),
-        let index = AccessPath::crit_slot(id.clone(), 1),
-        points(p, index, ?PtVal::Const(_));
-
-    // =====================================================================
-    // S4 — adequacy: the stratum that computes adequate contexts (N3)
-    // =====================================================================
-
-    /// `adequate(p, id)`: `Φ_a` holds here (§4.1.3). Note that an empty
-    /// `pt(recv)` with no free roots is adequate and dispatches nothing —
-    /// dead code, and sound.
+    /// `adequate(p, id)`: `Φ_a` holds here (§4.1.3) — nothing the caller still
+    /// controls reaches the deciding operand. It no longer *drives* anything;
+    /// it classifies, after the fact, the contexts in which resolution was
+    /// complete.
     relation adequate(Proc, CritId);
-    adequate(p.clone(), id.clone()) <-- pending(p, id), !resolved(p, id), !blocked(p, id);
+    adequate(p.clone(), id.clone()) <-- pending(p, id), !blocked(p, id);
 
-    // =====================================================================
-    // S5 — the subsequent stratum that *uses* adequacy. Output-only.
-    // =====================================================================
-
-    /// `forced(p, id)`: not adequate, and nowhere left to propagate to — an
-    /// entry procedure, a procedure with no callers, or the k-limit. The
-    /// instance must be ⊤-summarized here, which is precisely the
-    /// context-insensitive treatment.
-    relation forced(Proc, CritId);
-    forced(p.clone(), id.clone()) <--
-        pending(p, id), !resolved(p, id), !adequate(p, id), !can_propagate(p, id);
-    // An entry procedure has a caller the analysis cannot see, so propagating
-    // past it would never come back. Note this does *not* fire on Figure 1's
-    // `service`: its instances are adequate, and get dispatched precisely.
-    forced(p.clone(), id.clone()) <--
-        pending(p, id), !resolved(p, id), !adequate(p, id), entry(p);
-
-    /// `dispatch(p, id, callee)`: the implementations this instance may
-    /// reach. Under an adequate context the receiver's points-to set pins the
-    /// runtime types, so only those targets are taken; when forced, all CHA
-    /// targets are.
-    relation dispatch(Proc, CritId, Proc);
-    dispatch(p.clone(), id.clone(), callee.clone()) <--
-        adequate(p, id),
-        let recv = AccessPath::crit_slot(id.clone(), 0),
-        points(p, recv, ?PtVal::Alloc(l)),
-        alloc_type(l, t), crit_sig(id, sig), lookup(t, sig, callee);
-    dispatch(p.clone(), id.clone(), callee.clone()) <--
-        forced(p, id), crit_sig(id, sig), sig_target(sig, callee);
-
-    /// The accessor an `lv[v]` access resolves to: one tuple per constant the
-    /// index may hold, or the single undecidable `[π]`.
-    relation index_out(Proc, CritId, Accessor);
-    index_out(p.clone(), id.clone(), Accessor::Index(c.clone())) <--
-        adequate(p, id), index_crit(id), !index_undecidable(p, id),
-        let index = AccessPath::crit_slot(id.clone(), 1),
-        points(p, index, ?PtVal::Const(c));
-    index_out(p.clone(), id.clone(), Accessor::IndexUnknown) <--
-        adequate(p, id), index_crit(id), index_undecidable(p, id);
-    index_out(p.clone(), id.clone(), Accessor::IndexUnknown) <--
-        adequate(p, id), index_crit(id), !index_undecidable(p, id), !index_has_const(p, id);
-    index_out(p.clone(), id.clone(), Accessor::IndexUnknown) <--
-        forced(p, id), index_crit(id);
-
-    /// The round's output to the driver. Consumed by nothing in-program —
-    /// that is what keeps the whole struct stratified.
-    relation resolve_out(Proc, CritId, Proc);
-    resolve_out(p.clone(), id.clone(), callee.clone()) <-- dispatch(p, id, callee);
+    /// `settled(p, id)`: this placeholder defers nothing any more. Either it
+    /// was decided in an adequate context, or it was ⊤-summarized. `pending`
+    /// never shrinks, so this is what the query layer uses to tell a genuine
+    /// "critical ⟨…⟩ deferred" from a decided placeholder that is still
+    /// carried along.
+    relation settled(Proc, CritId);
+    settled(p.clone(), id.clone()) <-- resolve(p, id, _), !blocked(p, id);
+    settled(p.clone(), id.clone()) <-- index_acc(p, id, _), !blocked(p, id);
+    settled(p.clone(), id.clone()) <-- top(p, id);
 }
 
-/// Everything earlier rounds have decided about critical statements — the
-/// only state the driver carries between rounds.
-///
-/// It grows monotonically, and everything else about a round is re-derived
-/// from scratch, so a decision made late still improves summaries computed
-/// earlier and vice versa.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Decisions {
-    /// `(holder, instance, callee)`: a virtual call that may reach `callee`.
-    pub calls: BTreeSet<(Proc, CritId, Proc)>,
-    /// `(holder, instance, accessor)`: an `lv[v]` access that uses `accessor`.
-    pub indices: BTreeSet<(Proc, CritId, Accessor)>,
+ascent! {
+    /// Hybrid Inlining as one stratified derivation: every procedure's hybrid
+    /// summary, every pending critical statement, and every resolution, in a
+    /// single fixpoint.
+    ///
+    /// Build one with [`HybridAnalysis::for_program`] and `run()` it, or just
+    /// call [`run_hybrid`].
+    pub struct HybridAnalysis;
+
+    // The EDB schema of `ir::Program`, included from the same source so the
+    // two programs cannot drift apart. `for_program` copies the facts.
+    include_source!(crate::ir::edb);
+    include_source!(crate::analysis::hybrid_rules);
 }
 
-impl Decisions {
-    fn len(&self) -> usize {
-        self.calls.len() + self.indices.len()
-    }
-
-    /// The instances that have been decided, whichever kind they are. This is
-    /// what `resolved` — and so every N2 negation — is fed from.
-    fn resolved(&self) -> BTreeSet<(Proc, CritId)> {
-        self.calls
-            .iter()
-            .map(|(p, id, _)| (p.clone(), id.clone()))
-            .chain(
-                self.indices
-                    .iter()
-                    .map(|(p, id, _)| (p.clone(), id.clone())),
-            )
-            .collect()
-    }
-}
-
-impl Round {
-    /// A fresh round over `prog` with k-limit `k` and the decisions earlier
-    /// rounds have made; the round re-derives everything else.
+impl HybridAnalysis {
+    /// The analysis over `prog` with k-limit `k`, ready to `run()`.
     // Ascent generates private index fields alongside the public relation
     // fields, so a struct literal is not available here.
     #[allow(clippy::field_reassign_with_default)]
-    pub fn for_program(prog: &Program, k: usize, decided: &Decisions) -> Round {
-        let mut r = Round::default();
+    pub fn for_program(prog: &Program, k: usize) -> HybridAnalysis {
+        let mut r = HybridAnalysis::default();
 
         // Every relation of the shared `edb` schema, in declaration order.
-        // `edb_relation_counts_match` keeps this list from falling behind.
+        // `every_edb_relation_is_copied_into_the_analysis` keeps this list
+        // from falling behind.
         r.procedure = prog.procedure.clone();
         r.proc_type = prog.proc_type.clone();
         r.proc_sig = prog.proc_sig.clone();
@@ -564,24 +574,50 @@ impl Round {
         r.lookup = prog.lookup.clone();
 
         r.k_limit = vec![(k,)];
-        r.resolution = decided.calls.iter().cloned().collect();
-        r.index_resolution = decided.indices.iter().cloned().collect();
-        r.resolved = decided.resolved().into_iter().collect();
         r
+    }
+
+    /// The instances that no longer defer anything, as a set for lookup.
+    fn settled_set(&self) -> BTreeSet<(Proc, CritId)> {
+        self.settled.iter().cloned().collect()
+    }
+
+    /// Whether `base` is a placeholder node of an instance `p` has settled —
+    /// the internal plumbing of a decided critical statement, which the
+    /// derivation keeps but no report should show.
+    fn is_decided(settled: &BTreeSet<(Proc, CritId)>, p: &Proc, base: &Base) -> bool {
+        match base.crit_id() {
+            Some(id) => settled.contains(&(p.clone(), id.clone())),
+            None => false,
+        }
     }
 
     /// The hybrid summary of every procedure that has one, as access-path
     /// constraints (Figure 3 of the paper). Procedures with an empty summary
     /// are omitted.
+    ///
+    /// Constraints over a *settled* placeholder are dropped: the values that
+    /// flow through it are already in the summary by transitivity, and the
+    /// placeholder itself no longer stands for anything the caller must
+    /// decide. That is §10.5's "stratum C hides the redundant derivation from
+    /// reporting".
     pub fn summaries(&self) -> BTreeMap<Proc, Summary> {
+        let settled = self.settled_set();
         let mut out: BTreeMap<Proc, Summary> = BTreeMap::new();
         for (p, sup, sub) in &self.pub_edge {
+            if Self::is_decided(&settled, p, &sup.base) || Self::is_decided(&settled, p, &sub.base)
+            {
+                continue;
+            }
             out.entry(p.clone()).or_default().insert(Constraint::Path {
                 sup: sup.clone(),
                 sub: sub.clone(),
             });
         }
         for (p, sup, v) in &self.pub_points {
+            if Self::is_decided(&settled, p, &sup.base) {
+                continue;
+            }
             out.entry(p.clone())
                 .or_default()
                 .insert(v.constrain(sup.clone()));
@@ -589,12 +625,14 @@ impl Round {
         out
     }
 
-    /// The pending critical statements `p`'s summary still carries — the `S`
-    /// of `𝔥 = (𝔠, S)`.
+    /// The pending critical statements `p`'s summary still defers — the `S` of
+    /// `𝔥 = (𝔠, S)`. A decided placeholder is still *carried*, but it is no
+    /// longer deferred, so it is not reported here.
     pub fn placeholders(&self, p: &Proc) -> BTreeSet<CritId> {
+        let settled = self.settled_set();
         self.pending
             .iter()
-            .filter(|(q, id)| q == p && !self.resolved.contains(&(q.clone(), id.clone())))
+            .filter(|(q, id)| q == p && !settled.contains(&(q.clone(), id.clone())))
             .map(|(_, id)| id.clone())
             .collect()
     }
@@ -602,55 +640,41 @@ impl Round {
     /// `pt(ω)` as an outside observer should see it.
     ///
     /// Concrete values always count. A `PtVal::Path` counts only when its
-    /// root is still published — "and whatever the caller supplies", or "and
-    /// whatever this deferred critical statement returns". Paths rooted at a
-    /// *resolved* placeholder are dropped for the same reason locals are:
-    /// resolving it demoted the node to an internal one, and the values that
-    /// actually flow through it are already in the set by transitivity.
+    /// root is still published *and still stands for something undecided* —
+    /// "and whatever the caller supplies", or "and whatever this deferred
+    /// critical statement returns". A path rooted at a settled placeholder is
+    /// dropped for the same reason locals are: the values that actually flow
+    /// through it are already in the set by transitivity.
     pub fn points_to_path(&self, p: &Proc, path: &AccessPath) -> BTreeSet<PtVal> {
+        let settled = self.settled_set();
         self.points
             .iter()
             .filter(|(q, w, _)| q == p && w == path)
             .map(|(_, _, val)| val.clone())
             .filter(|val| match val {
-                PtVal::Path(w) => self.pub_root.contains(&(p.clone(), w.base.clone())),
+                PtVal::Path(w) => {
+                    self.pub_root.contains(&(p.clone(), w.base.clone()))
+                        && !Self::is_decided(&settled, p, &w.base)
+                }
                 _ => true,
             })
             .collect()
     }
 
-    /// [`Round::points_to_path`] for a bare local of `p`.
+    /// [`HybridAnalysis::points_to_path`] for a bare local of `p`.
     pub fn points_to(&self, p: &Proc, v: impl Into<Var>) -> BTreeSet<PtVal> {
         self.points_to_path(p, &AccessPath::var(v.into()))
     }
-}
 
-/// The result of running Hybrid Inlining to a fixpoint.
-pub struct Hybrid {
-    /// The final round — every relation of the analysis, fully derived.
-    pub round: Round,
-    /// Everything the analysis decided about critical statements.
-    pub decisions: Decisions,
-    /// How many rounds it took, including the final round that found nothing.
-    pub rounds: usize,
-}
-
-impl Hybrid {
     /// The call edges Hybrid Inlining admits for the critical statements —
     /// the precision claim of Figure 1 is a statement about this set.
-    ///
-    /// This is [`Hybrid::resolutions`], the union over all rounds, not the
-    /// final round's `dispatch`: once an instance has been resolved it is no
-    /// longer pending, so the round that reaches the fixpoint re-derives
-    /// nothing.
-    pub fn dispatches(&self) -> &BTreeSet<(Proc, CritId, Proc)> {
-        &self.decisions.calls
+    pub fn dispatches(&self) -> BTreeSet<(Proc, CritId, Proc)> {
+        self.resolve.iter().cloned().collect()
     }
 
     /// The callees the instance `id` held by `p` may reach.
     pub fn callees_of(&self, p: &Proc, id: &CritId) -> BTreeSet<Proc> {
-        self.decisions
-            .calls
+        self.resolve
             .iter()
             .filter(|(q, i, _)| q == p && i == id)
             .map(|(_, _, callee)| callee.clone())
@@ -659,8 +683,7 @@ impl Hybrid {
 
     /// The accessors the `lv[v]` instance `id` held by `p` resolves to.
     pub fn accessors_of(&self, p: &Proc, id: &CritId) -> BTreeSet<Accessor> {
-        self.decisions
-            .indices
+        self.index_acc
             .iter()
             .filter(|(q, i, _)| q == p && i == id)
             .map(|(_, _, acc)| acc.clone())
@@ -668,42 +691,23 @@ impl Hybrid {
     }
 }
 
-/// A guard against a driver bug turning into a hang. Each round either adds a
-/// decision or is the last, and decisions are bounded by
-/// procedures × k-bounded call strings × (CHA targets ∪ constants), so real
-/// programs stop far below this.
-const MAX_ROUNDS: usize = 1_000;
-
 /// Run Hybrid Inlining on `prog` with k-limit `k`.
 ///
-/// The loop is the Datalog reading of the paper's repeated application of
-/// `ready`: run the stratified round, feed every newly discovered resolution
-/// back in as an input relation, and repeat until a round discovers nothing.
-/// Because a round re-derives everything, a resolution discovered late still
-/// benefits from summaries improved earlier, and vice versa.
+/// One program, one fixpoint. Origination, propagation, publication,
+/// inlining, resolution and re-inlining are all mutually recursive rules in
+/// the same stratum, so a resolution discovered "late" still improves
+/// summaries derived "early" — semi-naive evaluation handles that, instead of
+/// a driver re-deriving everything.
 ///
-/// `k = 0` forbids propagation entirely, so every critical statement is
-/// ⊤-summarized where it occurs: that is exactly the compositional,
-/// context-insensitive analysis (Figure 2).
-pub fn run_hybrid(prog: &Program, k: usize) -> Hybrid {
-    let mut decisions = Decisions::default();
-
-    for round_no in 1..=MAX_ROUNDS {
-        let mut round = Round::for_program(prog, k, &decisions);
-        round.run();
-
-        let before = decisions.len();
-        decisions.calls.extend(round.resolve_out.iter().cloned());
-        decisions.indices.extend(round.index_out.iter().cloned());
-        if decisions.len() == before {
-            return Hybrid {
-                round,
-                decisions,
-                rounds: round_no,
-            };
-        }
-    }
-    panic!("hybrid inlining did not converge in {MAX_ROUNDS} rounds");
+/// `k = 0` forbids propagation entirely, so every critical statement whose
+/// context never pins it is ⊤-summarized where it occurs: that is essentially
+/// the compositional, context-insensitive analysis (Figure 2). An instance
+/// whose receiver is a purely local allocation is still pinned even at
+/// `k = 0`, which is strictly more precise than Figure 2.
+pub fn run_hybrid(prog: &Program, k: usize) -> HybridAnalysis {
+    let mut analysis = HybridAnalysis::for_program(prog, k);
+    analysis.run();
+    analysis
 }
 
 /// Render `id`'s dispatch decision for a human, e.g. `⟨L25@L28·L31b⟩ → Y.poly`.
@@ -719,4 +723,25 @@ pub fn render_summary(summary: &Summary, placeholders: &BTreeSet<CritId>) -> Vec
         lines.push(format!("critical {id} deferred"));
     }
     lines
+}
+
+/// The same rules under Ascent's *parallel* backend.
+///
+/// Nothing runs this — it exists so that a build fails if the program ever
+/// stops being parallelizable. The whole domain is `Arc`-backed and so
+/// `Send + Sync`, and a single fixpoint has no driver serializing it between
+/// rounds, so `ascent_par!` is a drop-in swap. Both programs include the one
+/// [`hybrid_rules`] source, so they cannot drift apart.
+#[cfg(test)]
+mod parallel {
+    use ascent::ascent_par;
+
+    use super::*;
+
+    ascent_par! {
+        pub struct ParallelHybridAnalysis;
+
+        include_source!(crate::ir::edb);
+        include_source!(crate::analysis::hybrid_rules);
+    }
 }

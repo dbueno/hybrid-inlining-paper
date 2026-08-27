@@ -1,0 +1,2 @@
+- `uncalled(p)` is only the statically uncalled things; how is this used?
+- can `root_map` be done in rust code?

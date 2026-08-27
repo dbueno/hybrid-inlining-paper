@@ -1,4 +1,10 @@
-# Plan: Hybrid Inlining in Ascent Datalog
+# Hybrid Inlining in Ascent Datalog
+
+> **Status: implemented.** Sections 1–5 are the original plan, kept as the
+> design record. Section 6 records what was built against each milestone,
+> section 7 the places the implementation diverged from the sketch, and
+> section 9 which risks turned out to be real. `cargo test` runs 38 tests;
+> `cargo run --example figure1` and `--example figure5` print Figures 3 and 6.
 
 Implement the paper's pointer analysis (§4.1) with Hybrid Inlining (§3.2) as an
 Ascent program layered on the existing EDB schema (`src/ir.rs`) and access-path
@@ -276,52 +282,140 @@ Bonus checkpoint: running with `K = 0` forces every critical instance to
 its published summaries must equal `figure2_summaries()` (Figure 2). Free
 regression oracle already in the repo.
 
-## 6. Milestones
+## 6. Milestones — **all done**
 
-1. **Ascent spike** — tiny throwaway `ascent!` verifying the exact syntax for
-   `agg () = not() in ...` and `agg n = count() in ...` with a user value type
-   as a column, and that the macro accepts the S2→S3→S4 stratification.
-   Fallback if in-macro negation fights us: hoist N3 into the driver (compute
-   `blocked`/`adequate` in Rust between two `ascent!` structs) — the strata
-   stay, just materialized by the host.
-2. **Domain** — `CritId`, `Base::{CritSlot, CritRet}`, `PtVal`; Display
-   (`⟨L25@[L28,L31b]⟩.slot0` or similar) + unit tests alongside the existing
-   ones. Keep everything `Send + Sync` (`Arc`) so `ascent_par!` stays open.
-3. **S1 + S2 without pendings** — criticality, devirtualization, intra rules,
-   direct-call inlining, publication. Checkpoint: `id`'s published summary is
-   exactly `ret@id ⊇ par_1@id`.
-4. **K=0 baseline** — forced ⊤-summarization at origin; assert published
-   summaries for all Figure 1 procedures equal `figure2_summaries()`.
-5. **Full pipeline** — pendings, S3–S5, driver loop, `resolved`/`inlined_*`
-   feedback. Checkpoint: Figure 1 end-to-end as in §5; tests for the two
-   assertions, for `bar1`/`bar2` summaries (Figure 3c/3f), and for the
-   absence of any `dispatch(_, c2-or-c4, Z.poly)` fact.
-6. **Wire up `examples/figure1.rs`** — build `HybridAnalysis` from
-   `figure1()`'s `Program`, run the driver, print per-procedure hybrid
-   summaries (Figure 3 style) and the `service()` verdicts. `cargo run
-   --example figure1` and `cargo test` must pass.
-7. **Stretch** — field rules (suffix congruence) and `lv[v]` criticals with
-   N4 (`eval` defs 4–5: all-constants ⇒ per-constant indices, else `[π]`);
-   encode Figure 5's `getP`/`setP` as a second example reproducing Figure 6.
+Status as implemented. `cargo test` (38 tests) and both examples pass;
+`cargo clippy --all-targets` is clean.
 
-## 7. Files
+1. **Ascent spike** — ✅ done and discarded. Ascent 0.8 accepts everything the
+   plan needed, and the driver-side fallback was *not* required:
+   - `agg n = count() in rel(..)` over an EDB relation (N1);
+   - first-class `!rel(args)` negation clauses (the macro desugars them to
+     `agg () = not() in ..`), used for N2/N3 and the `forced` rules;
+   - compound user types (`CritId`, `AccessPath`, `PtVal`, `Accessor`) as
+     relation columns, with `let` / `if let` / `?pat` body clauses;
+   - the S1→S2→S3→S4→S5 stratification, checked by the macro at compile time.
+2. **Domain** — ✅ `CritId` (`origin`/`push`/`nest`/`depth`),
+   `Base::{CritSlot, CritRet}`, `PtVal`, plus `AccessPath::{rebase, extend,
+   strip_prefix, crit_slot, crit_ret}`. Display renders a placeholder as
+   `⟨L25@L28·L31b⟩:arg0` / `:res`. Everything is `Arc`-backed and
+   `Send + Sync`, so `ascent_par!` stays open. 8 unit tests.
+3. **S1 + S2** — ✅ criticality, CHA devirtualization, the intra rules, the
+   `points` closure, publication, and direct-call inlining. Checkpoint met:
+   `id` publishes exactly `ret@FacadeImpl.id ⊇ par_1@FacadeImpl.id`.
+4. **K = 0 baseline** — ✅ `k_zero_reproduces_figure_2_exactly` asserts the
+   published summaries of *every* Figure 1 procedure equal
+   `figure1::figure2_summaries()`, the pre-existing oracle, on the nose.
+5. **Full pipeline** — ✅ pendings, S3–S5, the round driver, and the
+   `resolution`/`index_resolution`/`resolved` feedback. Figure 1 runs exactly
+   as §5 predicts, including the harmless `service` duplicates. Tests cover
+   the two `service()` assertions, Figures 3(a)/3(b)/3(c)/3(f), the absence of
+   any `bar1 → Z.poly` edge, and recursion.
+6. **`examples/figure1.rs`** — ✅ runs the driver at `k = 0` and `k = 4`,
+   prints per-procedure hybrid summaries Figure 3 style plus the resolved call
+   edges, and reports the `service()` verdicts.
+7. **Stretch** — ✅ both halves.
+   - Field and constant-index rules (Figure 4 defs 6–8) with **on-demand
+     suffix congruence**: `ω ⊇ ω′ ⟹ ω.a ⊇ ω′.a` fires only for suffixes some
+     path in the procedure actually mentions, keeping the path set finite. It
+     is triggered from *both* sides of an edge — the sub-side trigger is what
+     lets a store through a local (`v["old"]`) reach the published summary via
+     `ret@build ⊇ v`.
+   - `lv[v]` criticals with N4 (`index_undecidable`): `src/figure5.rs` encodes
+     Figure 5 and `examples/figure5.rs` reproduces Figure 6.
 
-- `src/access_path.rs` — extend `Base`, add `CritId`, `PtVal`.
-- `src/analysis.rs` (new) — the `ascent!` program(s) + `run_hybrid(prog:
-  &Program, k: usize) -> HybridAnalysis` driver.
-- `src/lib.rs` — `pub mod analysis;`.
-- `examples/figure1.rs` — call the analysis, print summaries, assert results.
+### What the analysis actually derives
 
-## 8. Risks / open questions
+Figure 1, `k = 4` (2 rounds):
 
-- **Ascent negation ergonomics**: `agg`-based `not` over a relation with
-  compound value columns needs the right index pattern; the spike de-risks
-  this first. Driver-side fallback preserves the stratified structure.
-- **Path explosion**: `flows` is a full transitive closure over access paths;
-  fine at POC scale, would need suffix-on-demand + depth capping for real
-  programs (the paper caps access-path growth too).
-- **Recursion**: the paper unrolls twice under DFS; here the monotone S2
-  fixpoint handles recursive *summaries* natively, and the k-limit bounds
-  recursive *pending chains*. Worth a small recursive test in milestone 5.
-- **Heap aliasing through fields** (`x ⊇ {l}, y ⊇ {l}` sharing `l.f`) is out
-  of scope for Figure 1/5; noted as future work (alloc-rooted paths).
+```text
+FacadeImpl.foo:   ret@foo ⊇ ⟨L25⟩:res             ⟨L25⟩ deferred
+                  ⟨L25⟩:arg0 ⊇ par_1@foo
+                  ⟨L25⟩:arg1 ⊇ par_2@foo          -- Figure 3(a)
+FacadeImpl.mid:   ... ⟨L25@L28⟩ ...               -- Figure 3(b)
+FacadeImpl.bar1:  ret@bar1 ⊇ par_1@bar1           -- Figure 3(c)
+FacadeImpl.bar2:  ret@bar2 ⊇ {l14}                -- Figure 3(f)
+
+⟨L25@L28·L31b⟩ → Y.poly     ⟨L25@L28·L34b⟩ → Z.poly
+pt(first) = pt(second) = {l37}     pt(third) = {l14}
+```
+
+Figure 5, `k = 4` vs `k = 0` — the index-sensitivity Hybrid Inlining buys:
+
+```text
+k = 4   build:  ret@build["old"] ⊇ par_1@build["cur"]     -- Figure 6(d)
+                getP/setP keep ⟨L2⟩ / ⟨L5⟩ deferred       -- Figure 6(a)
+k = 0   build:  ret@build[π] ⊇ par_1@build[π]             -- every slot merged
+```
+
+## 7. Where the design moved
+
+Six decisions differ from the sketch above; all are simplifications found
+while building, not retreats.
+
+- **No `flows` relation.** `points(p, a, PtVal::Path(b))` *is* the transitive
+  closure restricted to symbolically-rooted targets, which is all publication
+  and adequacy ever need. `pub_edge` reads it directly, so the separate
+  transitive-closure relation was dropped.
+- **No driver-side renaming.** The plan had the driver compute σ-renamed
+  `inlined_edge`/`inlined_points` in Rust. Instead the driver feeds back only
+  the *decisions* (`resolution`, `index_resolution`, `resolved`) as input
+  relations, and the renaming happens inside S2 against the callee's
+  **current** summary. Stratification is unaffected — the feedback relations
+  are still inputs — and a decision made in round 1 keeps paying off as the
+  callee's own summary improves in round 2.
+- **`forced` is `!can_propagate`, not `entry`.** `can_propagate(p, id)` is
+  false at an entry, at a procedure with no callers, *and* at the k-limit, so
+  one rule covers all three. `entry(p)` gets its own rule as well, for a
+  procedure that is both an entry and called from elsewhere. Both are guarded
+  by `!adequate`, without which Figure 1's `service` would ⊤-summarize its
+  own adequate instances and re-admit `Z.poly`.
+- **`Φ_a`'s second disjunct is folded into N1.** `|dispatch(proc, 𝔞)| = 1` is
+  handled at the CHA level by `sig_size(sig, 1) ⟹ mono_target`, which makes
+  such a site non-critical from the start. Narrowing by a path's *declared*
+  type is not modelled, so that case is CHA-only.
+- **A decisive slot per kind of critical statement.** `blocked` intersects
+  `free(𝔞)` with operand 0 for a virtual call (the receiver) and operand 1 for
+  an `lv[v]` access (the index), via `decisive_slot`.
+- **An `lv[v]` resolution lands on both the base's direct operands and its
+  symbolic paths.** The operands catch a local base (`v["old"]` in `build`);
+  the symbolic paths catch a parameter base (`par_1@setP[c]` in `setP`),
+  without which a store would never become visible to the caller.
+
+## 8. Files
+
+- `src/access_path.rs` — `Base::{CritSlot, CritRet}`, `CritId`, `PtVal`,
+  path rebasing/extension. 8 unit tests.
+- `src/analysis.rs` — the `ascent!` program `Round`, the `Decisions` the
+  driver carries between rounds, and `run_hybrid(prog, k) -> Hybrid`.
+- `src/figure1.rs`, `src/figure5.rs` — the two paper programs as EDB, with
+  `figure2_summaries()` as the context-insensitive oracle. Moved out of
+  `examples/` so `cargo test` actually runs their sanity tests, which it did
+  not before.
+- `tests/hybrid_inlining.rs` — 22 end-to-end tests.
+- `examples/figure1.rs`, `examples/figure5.rs` — the runners.
+
+## 9. Risks, resolved and remaining
+
+- **Ascent negation ergonomics** — *resolved*. `!rel(args)` works directly on
+  relations with compound value columns; no `agg`-based workaround and no
+  driver-side fallback were needed.
+- **Recursion** — *resolved*. A recursive *summary* is just the S2 fixpoint
+  (`a_recursive_summary_is_just_a_fixpoint`). A recursive *pending chain* is
+  bounded by the k-limit, and the deepest instance is `forced` to
+  ⊤-summarize. When the receiver is the recursive procedure's own parameter,
+  that ⊤ is unavoidable and shows up as imprecision — asserted, with the
+  reasoning, in `a_receiver_the_recursion_never_pins_falls_back_to_top`.
+- **Path explosion** — *still open, as expected*. Suffix congruence is
+  on-demand but still quadratic in observed paths per procedure, and there is
+  no depth cap on access paths. Fine at POC scale; a real program would need
+  the paper's access-path bound.
+- **Heap aliasing through fields** — *still open*. There are no alloc-rooted
+  paths, so two variables pointing at the same allocation site do not share
+  `l.f`. Figures 1 and 5 do not need it; a store through a base whose
+  points-to set is a bare allocation site is where it would first bite.
+- **Duplicated instances within a round** — *accepted, as the plan predicted*.
+  `⟨L25@L28·L31b⟩` resolves at `bar1` while `⟨L25@L28·L31b·L38⟩` is created at
+  `service` in the same round. Confluent and harmless (Theorem 3.3); at
+  `k = 2` the duplicates never arise and the answer is identical, which
+  `a_tight_k_limit_still_gets_the_right_answer` checks.

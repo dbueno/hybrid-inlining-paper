@@ -25,11 +25,95 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::ir::{Alloc, ArgIdx, Const, Field, Proc, Var};
+use crate::ir::{Alloc, ArgIdx, Const, Field, Proc, Stmt, Var};
 
-/// The root of an access path: a program variable, or one of the symbolic
+/// The identity of a *pending critical statement* — a critical statement
+/// (§3.2.1) that has been kept as a placeholder in a hybrid summary
+/// `𝔥 = (𝔠, S)` instead of being summarized under ⊤.
+///
+/// Propagating a hybrid summary into a caller (§3.2, "Propagation") renames
+/// the placeholder, so an instance needs an identity *per holder*: the
+/// original statement plus the chain of callsites it has been propagated
+/// through. That chain is a call string, and bounding its length is the
+/// k-limit of §3.2.2.
+///
+/// `chain` is ordered innermost-first: `⟨L25@L28·L31b⟩` is the `L25` instance
+/// that reached `bar1` by being propagated out of `foo` through `L28` and then
+/// out of `mid` through `L31b`.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CritId {
+    /// The critical statement itself.
+    pub stmt: Stmt,
+    /// Callsites the instance has been propagated through, innermost first.
+    pub chain: Arc<[Stmt]>,
+}
+
+impl CritId {
+    /// The instance as it originates, in the procedure that syntactically
+    /// contains the critical statement.
+    pub fn origin(stmt: impl Into<Stmt>) -> Self {
+        Self {
+            stmt: stmt.into(),
+            chain: Vec::new().into(),
+        }
+    }
+
+    /// Propagate one level out: the holder `p` is inlined at callsite `site`
+    /// in some caller `q`, so the instance becomes a pending of `q`.
+    pub fn push(&self, site: &Stmt) -> Self {
+        let mut chain = self.chain.to_vec();
+        chain.push(site.clone());
+        Self {
+            stmt: self.stmt.clone(),
+            chain: chain.into(),
+        }
+    }
+
+    /// Rename a callee's own pending `self` into the holder of the critical
+    /// statement `outer` it is being inlined at (hybrid-in-hybrid, §5 of the
+    /// plan): the callsite crossed is `outer.stmt`, and `outer`'s own chain
+    /// follows.
+    pub fn nest(&self, outer: &CritId) -> Self {
+        let mut chain = self.chain.to_vec();
+        chain.push(outer.stmt.clone());
+        chain.extend(outer.chain.iter().cloned());
+        Self {
+            stmt: self.stmt.clone(),
+            chain: chain.into(),
+        }
+    }
+
+    /// How far this instance has been propagated: the value the k-limit bounds.
+    pub fn depth(&self) -> usize {
+        self.chain.len()
+    }
+
+    /// The depth [`CritId::nest`] would produce, without building it.
+    pub fn nest_depth(&self, outer: &CritId) -> usize {
+        self.chain.len() + 1 + outer.chain.len()
+    }
+}
+
+impl fmt::Display for CritId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "⟨{}", self.stmt)?;
+        for (n, site) in self.chain.iter().enumerate() {
+            write!(f, "{}{site}", if n == 0 { "@" } else { "·" })?;
+        }
+        write!(f, "⟩")
+    }
+}
+
+impl fmt::Debug for CritId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+/// The root of an access path: a program variable, one of the symbolic
 /// variables the analysis invents to stand for values that flow into or out
-/// of a procedure.
+/// of a procedure, or one of the placeholder nodes of a pending critical
+/// statement.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Base {
     /// A local of the procedure being summarized. Transitively eliminated
@@ -40,6 +124,29 @@ pub enum Base {
     Param(Proc, ArgIdx),
     /// `ret@p`: `p`'s return value.
     Ret(Proc),
+    /// The `i`-th operand of a pending critical statement. This is the
+    /// paper's "critical statements are connected with all the variables they
+    /// access" made literal: the placeholder is an ordinary node of the
+    /// constraint graph, so operands reach it by the usual `⊇` edges.
+    CritSlot(CritId, ArgIdx),
+    /// The result of a pending critical statement.
+    CritRet(CritId),
+}
+
+impl Base {
+    /// True for the symbolic roots — everything except a local. Only symbolic
+    /// roots survive into a published summary, and only they can be `free(𝔞)`.
+    pub fn is_symbolic(&self) -> bool {
+        !matches!(self, Base::Var(_))
+    }
+
+    /// The pending instance this root belongs to, if any.
+    pub fn crit_id(&self) -> Option<&CritId> {
+        match self {
+            Base::CritSlot(id, _) | Base::CritRet(id) => Some(id),
+            _ => None,
+        }
+    }
 }
 
 impl From<Var> for Base {
@@ -54,6 +161,8 @@ impl fmt::Display for Base {
             Base::Var(v) => write!(f, "{v}"),
             Base::Param(p, i) => write!(f, "par_{i}@{p}"),
             Base::Ret(p) => write!(f, "ret@{p}"),
+            Base::CritSlot(id, i) => write!(f, "{id}:arg{i}"),
+            Base::CritRet(id) => write!(f, "{id}:res"),
         }
     }
 }
@@ -125,6 +234,17 @@ impl AccessPath {
         Self::new(Base::Ret(p.into()))
     }
 
+    /// The placeholder node for the `i`-th operand of a pending critical
+    /// statement. Operand 0 is the receiver of a virtual call.
+    pub fn crit_slot(id: CritId, i: ArgIdx) -> Self {
+        Self::new(Base::CritSlot(id, i))
+    }
+
+    /// The placeholder node for a pending critical statement's result.
+    pub fn crit_ret(id: CritId) -> Self {
+        Self::new(Base::CritRet(id))
+    }
+
     fn extended(&self, a: Accessor) -> Self {
         let mut suffix = self.accessors.to_vec();
         suffix.push(a);
@@ -153,6 +273,35 @@ impl AccessPath {
     pub fn is_base(&self) -> bool {
         self.accessors.is_empty()
     }
+
+    /// The same suffix hung off a different root. This is the whole of a
+    /// substitution σ: inlining renames roots and keeps suffixes (§2.1).
+    pub fn rebase(&self, base: Base) -> Self {
+        Self {
+            base,
+            accessors: Arc::clone(&self.accessors),
+        }
+    }
+
+    /// This path with `rest` appended, used by suffix congruence.
+    pub fn extend(&self, rest: &[Accessor]) -> Self {
+        let mut accessors = self.accessors.to_vec();
+        accessors.extend_from_slice(rest);
+        Self {
+            base: self.base.clone(),
+            accessors: accessors.into(),
+        }
+    }
+
+    /// If `self` is `prefix` followed by more accessors, the extra accessors.
+    /// `ω.f.g`.strip_prefix(`ω`) is `[.f, .g]`; unrelated paths give `None`.
+    pub fn strip_prefix(&self, prefix: &AccessPath) -> Option<&[Accessor]> {
+        if self.base != prefix.base || self.accessors.len() < prefix.accessors.len() {
+            return None;
+        }
+        let (head, rest) = self.accessors.split_at(prefix.accessors.len());
+        (head == &*prefix.accessors).then_some(rest)
+    }
 }
 
 impl fmt::Display for AccessPath {
@@ -166,6 +315,66 @@ impl fmt::Display for AccessPath {
 }
 
 impl fmt::Debug for AccessPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+/// An element of a points-to set: what the right-hand side of a constraint
+/// contributes to `pt(ω)`.
+///
+/// The `Path` case is what makes the whole scheme work. A compositional
+/// summary is computed without a caller, so `pt(ω)` genuinely may contain
+/// *symbolic* paths (§4.1.2) — "whatever the caller passes as `par_1@p`" — and
+/// the analysis must never drop them. Adequacy (`Φ_a`, §4.1.3) is then exactly
+/// the absence of such a tuple: `pt(recv) ∩ free(𝔞) = ∅` holds iff `pt(recv)`
+/// contains no `Path` rooted at something still visible outside the holder.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PtVal {
+    /// `ω ⊇ ω′`: an as-yet-unknown value, named by the path it will come from.
+    Path(AccessPath),
+    /// `ω ⊇ {l}`: the object allocated at site `l`.
+    Alloc(Alloc),
+    /// `ω ⊇ {c}`: the constant `c`.
+    Const(Const),
+}
+
+impl PtVal {
+    /// True for [`PtVal::Path`] — a value the caller may still change.
+    pub fn is_path(&self) -> bool {
+        matches!(self, PtVal::Path(_))
+    }
+
+    /// The constraint `sup ⊇ self`.
+    pub fn constrain(&self, sup: AccessPath) -> Constraint {
+        match self {
+            PtVal::Path(sub) => Constraint::Path {
+                sup,
+                sub: sub.clone(),
+            },
+            PtVal::Alloc(sub) => Constraint::Alloc {
+                sup,
+                sub: sub.clone(),
+            },
+            PtVal::Const(sub) => Constraint::Const {
+                sup,
+                sub: sub.clone(),
+            },
+        }
+    }
+}
+
+impl fmt::Display for PtVal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PtVal::Path(w) => write!(f, "{w}"),
+            PtVal::Alloc(l) => write!(f, "{{{l}}}"),
+            PtVal::Const(c) => write!(f, "{{{c}}}"),
+        }
+    }
+}
+
+impl fmt::Debug for PtVal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
     }
@@ -242,6 +451,82 @@ mod tests {
         assert!(map.is_base());
         assert!(!cur.is_base());
         assert_eq!(map.base, cur.base);
+    }
+
+    // Figure 1's L25 instance as it walks out of foo -> mid -> bar1.
+    #[test]
+    fn a_crit_id_prints_its_call_string() {
+        let c0 = CritId::origin("L25");
+        assert_eq!(c0.to_string(), "⟨L25⟩");
+        assert_eq!(c0.depth(), 0);
+
+        let c1 = c0.push(&"L28".into());
+        let c2 = c1.push(&"L31b".into());
+        assert_eq!(c1.to_string(), "⟨L25@L28⟩");
+        assert_eq!(c2.to_string(), "⟨L25@L28·L31b⟩");
+        assert_eq!(c2.depth(), 2);
+
+        // The placeholder nodes are ordinary access-path roots.
+        assert_eq!(
+            AccessPath::crit_slot(c2.clone(), 0).to_string(),
+            "⟨L25@L28·L31b⟩:arg0"
+        );
+        assert_eq!(AccessPath::crit_ret(c2).to_string(), "⟨L25@L28·L31b⟩:res");
+    }
+
+    // Inlining a callee that is itself hybrid renames the callee's pending
+    // into the caller; the callsite crossed is the critical statement.
+    #[test]
+    fn nesting_splices_the_outer_call_string_on() {
+        let inner = CritId::origin("L99").push(&"L50".into());
+        let outer = CritId::origin("L25").push(&"L28".into());
+        let nested = inner.nest(&outer);
+        assert_eq!(nested.to_string(), "⟨L99@L50·L25·L28⟩");
+        assert_eq!(nested.depth(), inner.nest_depth(&outer));
+    }
+
+    #[test]
+    fn rebasing_keeps_the_suffix_and_stripping_recovers_it() {
+        let callee = AccessPath::param("getP", 1).index(r#""cur""#);
+        let sigma = callee.rebase(Base::Var("map@caller".into()));
+        assert_eq!(sigma.to_string(), r#"map@caller["cur"]"#);
+
+        let root = AccessPath::var("map@caller");
+        assert_eq!(sigma.strip_prefix(&root).unwrap().len(), 1);
+        assert_eq!(root.strip_prefix(&sigma), None);
+        assert_eq!(sigma.strip_prefix(&callee), None); // different roots
+        assert_eq!(root.extend(sigma.strip_prefix(&root).unwrap()), sigma);
+    }
+
+    #[test]
+    fn only_locals_are_non_symbolic() {
+        let id = CritId::origin("L25");
+        assert!(!Base::Var("tv".into()).is_symbolic());
+        assert!(Base::Param("foo".into(), 1).is_symbolic());
+        assert!(Base::Ret("foo".into()).is_symbolic());
+        assert!(Base::CritSlot(id.clone(), 0).is_symbolic());
+        assert!(Base::CritRet(id.clone()).is_symbolic());
+        assert_eq!(Base::CritRet(id.clone()).crit_id(), Some(&id));
+        assert_eq!(Base::Ret("foo".into()).crit_id(), None);
+    }
+
+    #[test]
+    fn a_pt_value_renders_as_the_constraint_it_stands_for() {
+        let ret = AccessPath::ret("Z.poly");
+        assert_eq!(
+            PtVal::Alloc("l14".into())
+                .constrain(ret.clone())
+                .to_string(),
+            "ret@Z.poly ⊇ {l14}"
+        );
+        assert_eq!(
+            PtVal::Path(AccessPath::param("Y.poly", 1))
+                .constrain(AccessPath::ret("Y.poly"))
+                .to_string(),
+            "ret@Y.poly ⊇ par_1@Y.poly"
+        );
+        assert!(PtVal::Path(ret).is_path());
+        assert!(!PtVal::Const("0".into()).is_path());
     }
 
     #[test]

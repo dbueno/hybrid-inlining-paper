@@ -248,9 +248,15 @@ mod tests {
     fn a_constraint_yields_its_paths_lhs_first() {
         let l = AccessPath::ret("p");
         let r = AccessPath::param("p", 1);
-        let subset = Constraint::Path { sup: l.clone(), sub: r.clone() };
+        let subset = Constraint::Path {
+            sup: l.clone(),
+            sub: r.clone(),
+        };
         assert_eq!(subset.paths().collect::<Vec<_>>(), vec![&l, &r]);
-        let alloc = Constraint::Alloc { sup: l.clone(), sub: "l14".into() };
+        let alloc = Constraint::Alloc {
+            sup: l.clone(),
+            sub: "l14".into(),
+        };
         assert_eq!(alloc.paths().collect::<Vec<_>>(), vec![&l]);
     }
 }

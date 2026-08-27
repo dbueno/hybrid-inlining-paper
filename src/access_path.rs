@@ -175,19 +175,19 @@ impl fmt::Debug for AccessPath {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Constraint {
     /// `ω ⊇ ω′`: everything `ω′` may point to, `ω` may point to.
-    Path(AccessPath, AccessPath),
+    Path { sup: AccessPath, sub: AccessPath },
     /// `ω ⊇ {l}`: `ω` may point to the object allocated at site `l`.
-    Alloc(AccessPath, Alloc),
+    Alloc { sup: AccessPath, sub: Alloc },
     /// `ω ⊇ {c}`: `ω` may hold the constant `c`.
-    Const(AccessPath, Const),
+    Const { sup: AccessPath, sub: Const },
 }
 
 impl Constraint {
     /// The access paths this constraint mentions, left-hand side first.
     pub fn paths(&self) -> impl Iterator<Item = &AccessPath> {
         let (lhs, rhs) = match self {
-            Constraint::Path(l, r) => (l, Some(r)),
-            Constraint::Alloc(l, _) | Constraint::Const(l, _) => (l, None),
+            Constraint::Path { sup, sub } => (sup, Some(sub)),
+            Constraint::Alloc { sup, .. } | Constraint::Const { sup, .. } => (sup, None),
         };
         std::iter::once(lhs).chain(rhs)
     }
@@ -196,9 +196,9 @@ impl Constraint {
 impl fmt::Display for Constraint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Constraint::Path(l, r) => write!(f, "{l} ⊇ {r}"),
-            Constraint::Alloc(l, site) => write!(f, "{l} ⊇ {{{site}}}"),
-            Constraint::Const(l, c) => write!(f, "{l} ⊇ {{{c}}}"),
+            Constraint::Path { sup, sub } => write!(f, "{sup} ⊇ {sub}"),
+            Constraint::Alloc { sup, sub } => write!(f, "{sup} ⊇ {{{sub}}}"),
+            Constraint::Const { sup, sub } => write!(f, "{sup} ⊇ {{{sub}}}"),
         }
     }
 }
@@ -228,10 +228,10 @@ mod tests {
         assert_eq!(AccessPath::ret("getP").field("g").to_string(), "ret@getP.g");
         assert_eq!(AccessPath::var("tv").to_string(), "tv");
 
-        let c = Constraint::Path(
-            AccessPath::ret("FacadeImpl.id"),
-            AccessPath::param("FacadeImpl.id", 1),
-        );
+        let c = Constraint::Path {
+            sup: AccessPath::ret("FacadeImpl.id"),
+            sub: AccessPath::param("FacadeImpl.id", 1),
+        };
         assert_eq!(c.to_string(), "ret@FacadeImpl.id ⊇ par_1@FacadeImpl.id");
     }
 
@@ -248,9 +248,9 @@ mod tests {
     fn a_constraint_yields_its_paths_lhs_first() {
         let l = AccessPath::ret("p");
         let r = AccessPath::param("p", 1);
-        let subset = Constraint::Path(l.clone(), r.clone());
+        let subset = Constraint::Path { sup: l.clone(), sub: r.clone() };
         assert_eq!(subset.paths().collect::<Vec<_>>(), vec![&l, &r]);
-        let alloc = Constraint::Alloc(l.clone(), "l14".into());
+        let alloc = Constraint::Alloc { sup: l.clone(), sub: "l14".into() };
         assert_eq!(alloc.paths().collect::<Vec<_>>(), vec![&l]);
     }
 }

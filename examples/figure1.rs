@@ -244,19 +244,19 @@ fn figure2_summaries() -> BTreeMap<Proc, Summary> {
     // been transitively eliminated, leaving only symbolic roots.
     summaries.insert(
         p("FacadeImpl.id"),
-        Summary::from([Constraint::Path(ret("FacadeImpl.id"), par("FacadeImpl.id", 1))]),
+        Summary::from([Constraint::Path { sup: ret("FacadeImpl.id"), sub: par("FacadeImpl.id", 1) }]),
     );
 
     // Figure 2(c): Y.poly returns its argument.
     summaries.insert(
         p("Y.poly"),
-        Summary::from([Constraint::Path(ret("Y.poly"), par("Y.poly", 1))]),
+        Summary::from([Constraint::Path { sup: ret("Y.poly"), sub: par("Y.poly", 1) }]),
     );
 
     // Figure 2(d): Z.poly returns a fresh Obj allocated at l14.
     summaries.insert(
         p("Z.poly"),
-        Summary::from([Constraint::Alloc(ret("Z.poly"), l14())]),
+        Summary::from([Constraint::Alloc { sup: ret("Z.poly"), sub: l14() }]),
     );
 
     // Figure 2(e): summarizing foo() inlines *both* poly implementations at
@@ -266,8 +266,8 @@ fn figure2_summaries() -> BTreeMap<Proc, Summary> {
         summaries.insert(
             p(q),
             Summary::from([
-                Constraint::Path(ret(q), par(q, 2)),
-                Constraint::Alloc(ret(q), l14()),
+                Constraint::Path { sup: ret(q), sub: par(q, 2) },
+                Constraint::Alloc { sup: ret(q), sub: l14() },
             ]),
         );
     }
@@ -279,8 +279,8 @@ fn figure2_summaries() -> BTreeMap<Proc, Summary> {
         summaries.insert(
             p(q),
             Summary::from([
-                Constraint::Path(ret(q), par(q, 1)),
-                Constraint::Alloc(ret(q), l14()),
+                Constraint::Path { sup: ret(q), sub: par(q, 1) },
+                Constraint::Alloc { sup: ret(q), sub: l14() },
             ]),
         );
     }
@@ -390,7 +390,7 @@ mod tests {
                         Base::Var(_) => unreachable!(),
                     }
                 }
-                if let Constraint::Alloc(_, site) = constraint {
+                if let Constraint::Alloc { sub: site, .. } = constraint {
                     assert!(sites.contains(site), "unknown allocation site {site}");
                 }
             }

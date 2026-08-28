@@ -10,7 +10,8 @@
 
 ## Questions
 
-- What are "placeholder nodes", like used in `pub_root`.
+- What are "placeholder nodes", like used in `pub_root`. `CritSlot` and `CritRet`
+- Change comments for `resolve`
 
 
 

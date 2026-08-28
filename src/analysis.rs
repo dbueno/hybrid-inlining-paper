@@ -292,7 +292,7 @@ ascent_source! { hybrid_rules:
     /// The operand positions of a pending instance, and the signature it
     /// dispatches — both read off the original statement.
     relation crit_operand(CritId, ArgIdx);
-    crit_operand(id.clone(), *i) <-- pending(_, id), let s = id.stmt.clone(), actual_arg(s, i, _);
+    crit_operand(id.clone(), *i) <-- pending(_, id), actual_arg(&id.stmt, i, _);
     crit_operand(id.clone(), 0) <-- index_crit(id);
     crit_operand(id.clone(), 1) <-- index_crit(id);
     crit_operand(id.clone(), 2) <-- store_crit(id);
@@ -303,11 +303,11 @@ ascent_source! { hybrid_rules:
     relation store_crit(CritId);
     relation index_crit(CritId);
     call_crit(id.clone()) <--
-        pending(_, id), let s = id.stmt.clone(), virtual_call(s, _, _);
+        pending(_, id), virtual_call(&id.stmt, _, _);
     load_crit(id.clone()) <--
-        pending(_, id), let s = id.stmt.clone(), load_index_var(s, _, _, _);
+        pending(_, id), load_index_var(&id.stmt, _, _, _);
     store_crit(id.clone()) <--
-        pending(_, id), let s = id.stmt.clone(), store_index_var(s, _, _, _);
+        pending(_, id), store_index_var(&id.stmt, _, _, _);
     index_crit(id.clone()) <-- load_crit(id);
     index_crit(id.clone()) <-- store_crit(id);
 
@@ -320,7 +320,7 @@ ascent_source! { hybrid_rules:
 
     relation crit_sig(CritId, Sig);
     crit_sig(id.clone(), sig.clone()) <--
-        pending(_, id), let s = id.stmt.clone(), virtual_call(s, _, sig);
+        pending(_, id), virtual_call(&id.stmt, _, sig);
 
     // -- free(𝔞) and the published vocabulary ------------------------------
 
@@ -403,7 +403,7 @@ ascent_source! { hybrid_rules:
         pending(p, id), decisive_slot(id, i),
         let decisive = AccessPath::crit_slot(id.clone(), *i),
         points(p, decisive, ?PtVal::Path(w)),
-        let wb = w.base.clone(), free_root(p, wb);
+        free_root(p, &w.base);
 
     /// `top(p, id)`: the instance must be ⊤-summarized here and now. It is
     /// blocked — the context never pins it — and there is nowhere left to
@@ -476,12 +476,11 @@ ascent_source! { hybrid_rules:
 
     edge(p.clone(), a.rebase(ta.clone()), b.rebase(tb.clone())) <--
         resolve(p, id, callee), pub_edge(callee, a, b),
-        let ab = a.base.clone(), crit_map(p, id, ab, ta),
-        let bb = b.base.clone(), crit_map(p, id, bb, tb);
+        crit_map(p, id, &a.base, ta), crit_map(p, id, &b.base, tb);
 
     points(p.clone(), a.rebase(ta.clone()), v.clone()) <--
         resolve(p, id, callee), pub_points(callee, a, v),
-        let ab = a.base.clone(), crit_map(p, id, ab, ta);
+        crit_map(p, id, &a.base, ta);
 
     // -- resolving an lv[v] access ----------------------------------------
 

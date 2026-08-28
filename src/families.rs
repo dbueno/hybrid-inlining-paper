@@ -21,6 +21,7 @@
 //! | [`fields_chain`] | access-path *length* growing through inlining |
 //! | [`recursive_field`] | termination when inlining feeds its own summary |
 //! | [`dead_receiver`] | the vacuous corner of adequacy: an empty deciding operand |
+//! | [`wide`] | many procedures × real data flow, with nothing critical |
 
 use std::collections::BTreeMap;
 
@@ -350,6 +351,79 @@ pub fn recursive_field() -> Program {
     b.proc_("Entry", &["this@Entry"]);
     b.alloc("E0", "Entry", "o", "lo", "Obj");
     b.call("E1", "Entry", "P", &["this@Entry", "o"], Some("res"));
+    b.entry("Entry");
+    b.done()
+}
+
+/// Many procedures, wide interprocedural data flow, **nothing critical**.
+///
+/// The families above each isolate one axis, and between them they leave a
+/// gap: the shapes with many procedures ([`chain`], [`fanin`],
+/// [`fields_chain`]) give each procedure a body of one or two statements, and
+/// the shape with a real intraprocedural closure ([`alias`]) is a single
+/// procedure with no calls at all. Nothing measures the ordinary case — a
+/// program that is large because it has *many* procedures, each doing a
+/// nontrivial amount of pointer flow, with dispatch essentially free.
+///
+/// `wide(m, w)` is that case: `m` leaf procedures, each an [`alias`]-style
+/// merge of `w` allocations into `w` variables with the parameter seeded into
+/// the chain, so every leaf has an `Θ(w²)` local `points` closure *and* a
+/// summary its callers must inline. The leaves are grouped four at a time
+/// under mid-level callers that merge their results, and `Entry` merges the
+/// mids. No `virtual_call`, no `load_index_var`/`store_index_var`: there is
+/// not one critical statement in the program, so `pending` stays empty and
+/// `k` is irrelevant.
+///
+/// Depth is fixed at 3 while `m` grows, which is the point. The other
+/// families grow the *length* of the dependency chain the fixpoint has to walk
+/// (`alias(n)` needs `n` semi-naive rounds to push `l_0` to `c_n`); this one
+/// grows its *width*, so each round has `Θ(m)` independent procedures to work
+/// on. That is the shape most favourable to a parallel evaluator, and so the
+/// honest test of whether parallelism can ever pay here.
+pub fn wide(m: usize, w: usize) -> Program {
+    const GROUP: usize = 4;
+    let mut b = B::default();
+
+    for i in 0..m {
+        let wi = format!("W{i}");
+        b.proc_(&wi, &[&format!("this@{wi}"), &format!("x@{wi}")]);
+        for j in 0..w {
+            b.alloc(&format!("A{j}@{wi}"), &wi, &format!("a{j}@{wi}"), &format!("l{j}@{wi}"), "Obj");
+        }
+        // The parameter seeds the merge chain, so the summary is `ret ⊇ par_1`
+        // as well as `ret ⊇ {l_j}` — a caller inlining it gets real flow, not
+        // just a set of allocation sites.
+        b.mov(&format!("M0@{wi}"), &wi, &format!("c0@{wi}"), &format!("x@{wi}"));
+        for j in 1..w {
+            b.mov(&format!("Mc{j}@{wi}"), &wi, &format!("c{j}@{wi}"), &format!("c{}@{wi}", j - 1));
+            b.mov(&format!("Ma{j}@{wi}"), &wi, &format!("c{j}@{wi}"), &format!("a{j}@{wi}"));
+        }
+        b.ret(&wi, &format!("c{}@{wi}", w.saturating_sub(1)));
+    }
+
+    let mids = m.div_ceil(GROUP);
+    for j in 0..mids {
+        let mj = format!("D{j}");
+        b.proc_(&mj, &[&format!("this@{mj}"), &format!("x@{mj}")]);
+        for i in (j * GROUP)..((j + 1) * GROUP).min(m) {
+            b.call(
+                &format!("C{i}@{mj}"),
+                &mj,
+                &format!("W{i}"),
+                &[&format!("this@{mj}"), &format!("x@{mj}")],
+                Some(&format!("r{i}@{mj}")),
+            );
+            b.mov(&format!("Mr{i}@{mj}"), &mj, &format!("acc@{mj}"), &format!("r{i}@{mj}"));
+        }
+        b.ret(&mj, &format!("acc@{mj}"));
+    }
+
+    b.proc_("Entry", &["this@Entry"]);
+    b.alloc("E0", "Entry", "o", "lo", "Obj");
+    for j in 0..mids {
+        b.call(&format!("E@{j}"), "Entry", &format!("D{j}"), &["this@Entry", "o"], Some(&format!("r{j}")));
+        b.mov(&format!("Em@{j}"), "Entry", "res", &format!("r{j}"));
+    }
     b.entry("Entry");
     b.done()
 }

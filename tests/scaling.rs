@@ -148,6 +148,40 @@ fn suffix_congruence_is_quadratic_within_a_procedure() {
     }
 }
 
+/// The ordinary large program: many procedures, real pointer flow in each,
+/// and nothing critical. The property worth pinning is that the two costs
+/// stay separate — cost per procedure is a constant in `m`, and the local
+/// quadratic in `w` does not escape into the published summary.
+#[test]
+fn many_procedures_cost_a_constant_each_when_nothing_is_critical() {
+    let pts: Vec<(Program, usize)> =
+        [8usize, 16, 32, 64].iter().map(|&m| (wide(m, 8), 0)).collect();
+    for rel in ["edge", "points", "path_used", "pub_edge", "pub_points", "root_map"] {
+        let d = fit(rel, &pts);
+        assert!(d < 1.15, "wide: {rel} grows as |P|^{d:.2}, expected ~linear in m");
+    }
+
+    // No virtual call and no variable index, so none of the critical-statement
+    // machinery is reachable at all — this is the family that isolates the
+    // rest of the analysis from it.
+    let m = run_sizes(&wide(32, 8), 0);
+    for rel in ["critical", "pending", "resolve", "top", "adequate"] {
+        assert_eq!(m[rel], 0, "wide: {rel} should be empty with nothing critical");
+    }
+
+    // Widening the local closure is quadratic inside each procedure, and the
+    // published summary is one `pub_edge` per procedure regardless.
+    let wpts: Vec<(Program, usize)> =
+        [2usize, 4, 8, 16].iter().map(|&w| (wide(64, w), 0)).collect();
+    assert!(fit("points", &wpts) > 1.5, "wide: local points should be quadratic in w");
+    let flat: Vec<usize> =
+        [2usize, 4, 8, 16].iter().map(|&w| run_sizes(&wide(64, w), 0)["pub_edge"]).collect();
+    assert!(
+        flat.windows(2).all(|x| x[0] == x[1]),
+        "wide: pub_edge should not depend on the local closure, got {flat:?}"
+    );
+}
+
 /// Access-path *depth* has no limit of its own: inlining appends one accessor
 /// per call level. Tuple counts stay linear here, so only this test sees it.
 #[test]

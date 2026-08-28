@@ -51,7 +51,7 @@ Three distinct growth regimes, and the analysis touches all three.
 
 | regime | relations | driven by |
 |---|---|---|
-| linear in program size | `edge`, `points`, `pending`, `pub_edge`, `root_map`, … | call depth and fan-in, on their own |
+| linear in program size | `edge`, `points`, `pending`, `pub_edge`, `root_map`, … | call depth, fan-in, and procedure count, on their own |
 | **quadratic in program size** | `points`, `edge`, `path_used` | points-to sets, and suffix congruence, *within one procedure* |
 | **exponential in call depth** | `pending` and everything keyed on a `CritId` | the number of call strings; bounded only by `k` |
 
@@ -228,6 +228,60 @@ code — and propagating it would only manufacture equally empty placeholders in
 every caller. `families::dead_receiver()` is the program, and
 `a_receiver_with_no_values_stays_put_and_dispatches_nothing` pins the behaviour.
 
+## The ordinary case: many procedures, real flow, nothing critical
+
+The families above each isolate one axis, and between them they left a gap.
+The shapes with many procedures — `chain`, `fanin`, `fields_chain` — give each
+procedure a body of one or two statements; the shapes with a real
+intraprocedural closure — `alias`, `fields` — are a single procedure with no
+calls at all. Nothing measured the ordinary large program: many procedures,
+each doing a nontrivial amount of pointer flow, with dispatch essentially
+free.
+
+`wide(m, w)` is that program. `m` leaf procedures, each an `alias`-style merge
+of `w` allocations into `w` variables with the parameter seeded into the chain;
+the leaves grouped four at a time under mid-level callers that merge their
+results; `Entry` merging the mids. Depth is fixed at 3 while `m` grows. There
+is no `virtual_call` and no variable index anywhere in it, so `critical`,
+`pending`, `resolve`, `top` and `adequate` are all **empty** and `k` is
+irrelevant — this is the rest of the analysis, measured with the
+critical-statement machinery switched off.
+
+The two costs stay separate, which is the property worth having:
+
+```
+  wide(m, 8) — m procedures with a nontrivial local closure each
+  relation                |P|^d  last/prev   sizes (m = 4 8 16 32 64)
+  points                   1.00       2.00   368 733 1463 2923 5843
+  edge                     1.00       2.00   86 171 341 681 1361
+  path_used                0.99       1.99   99 194 384 764 1524
+  pub_edge                 1.01       2.00   5 10 20 40 80
+  root_map                 1.01       2.00   15 30 60 120 240
+
+  wide(64, w) — 64 procedures, local closure of width w in each
+  relation                |P|^d  last/prev   sizes (w = 2 4 8 16)
+  points                   1.79       2.71   1043 2387 5843 15827   <== superlinear
+  edge                     0.92       1.75   593 849 1361 2385
+  pub_edge                 0.00       1.00   80 80 80 80
+  root_map                 0.00       1.00   240 240 240 240
+```
+
+Every relation is **linear in `m`**: adding a procedure costs a constant, not
+a constant times the rest of the program. Widening the local closure is the
+`Θ(w²)` of `alias` again, and `pub_edge` is flat at one per procedure while it
+happens — the same containment `alias(n)` and `fields(n)` showed, now
+confirmed across a call graph rather than inside one body. **The
+intraprocedural quadratic is not multiplied by the number of callsites.** That
+is the compositional claim, and this is the family that tests it.
+
+`wide` also differs from every other large family in a way tuple counts do not
+show: it is *wide* rather than *deep* in fixpoint iterations. `alias(n)` needs
+roughly `n` semi-naive rounds to push `l_0` along the chain to `c_n`, and each
+round carries a small delta. `wide(m, w)` has `m` mutually independent
+procedures whose closures all advance in the same round, so the delta per
+round grows with `m`. That distinction is what the parallel section below
+turns on.
+
 ## What tuple counts hide: access-path depth
 
 `fields_chain(n)` is `n` procedures, each appending one accessor to its
@@ -306,7 +360,7 @@ correctness test as much as a timing one. **All three agree everywhere**, which
 is also the differential check that the `blocked` guard on propagation derives
 the same relations under all three evaluators.
 
-### The result: parallelism loses, badly — and more threads make it worse
+### The result on small programs: parallelism loses, badly
 
 20 rayon threads, `--release`, best-of within a 750 ms budget per case.
 
@@ -338,6 +392,8 @@ the same relations under all three evaluators.
 
 Both parallel backends are **5× to 1400× slower than sequential**, on every
 single case. On Figure 1 itself: 0.47 ms sequential against 298 ms parallel.
+(The `wide` family is measured separately below; it is the case where this
+stops being true.)
 
 The obvious question is how much of that is the concurrent data structures
 (`DashMap`-backed indices, `boxcar` relations) and how much is threads getting
@@ -391,19 +447,81 @@ whereas most individual rules have nothing to spread across 20 threads.
 Enabling `#![inter_rule_parallelism]` was the right call — it is just not
 enough to overcome the per-rule overhead.
 
-**Nothing here is big enough for parallelism to pay.** Extrapolating the
+**Nothing above is big enough for parallelism to pay.** Extrapolating the
 1-thread trend, the concurrent data structures stop costing anything around
 `branching(12)`-scale work (~400k tuples). Multi-threading would then need
 deltas large enough to amortize fork/join, which on this rule set means
-something one or two orders of magnitude larger again. If parallel evaluation
-is ever wanted seriously, the lever is not the thread count — it is reducing
-the number of rules that fire per round, or batching rounds so each rule sees
-a bigger delta.
+something one or two orders of magnitude larger again. That prediction turned
+out to be right, and the next section is the family that reaches it.
 
-The practical conclusion is that the parallel backends should stay what they
-were meant to be: a guarantee that the rules remain parallelizable, plus a
-differential test of the sequential evaluator. `RAYON_NUM_THREADS=1` is the
-configuration to use if one of them must be run.
+### Where parallelism does pay: wide programs
+
+None of the families above tests the shape a parallel evaluator actually
+wants. Every large case is either iteration-*deep* — `alias(n)` needs `n`
+semi-naive rounds, each with a small delta — or exponential in a single
+relation. `wide(m, 8)` is the first that is iteration-*wide*: `m` independent
+procedures whose local closures all advance in the same round, so the delta a
+rule sees grows with `m` instead of staying at a handful of tuples.
+
+20 threads:
+
+```
+  case                           |P|    tuples         seq         par      par+ir    par×     ir×  agree
+  wide(32, 8)                   1916      7558      1.87ms    203.12ms    137.29ms   0.01x   0.01x  yes
+  wide(128, 8)                  7652     30166      7.82ms    219.32ms    155.95ms   0.04x   0.05x  yes
+  wide(512, 8)                 30596    120598     44.97ms    254.21ms    176.58ms   0.18x   0.25x  yes
+  wide(2048, 8)               122372    482326    285.84ms    341.02ms    262.26ms   0.84x   1.09x  yes
+  wide(8192, 8)               489476   1929238    1589.40ms   704.11ms    573.28ms   2.26x   2.77x  yes
+```
+
+`RAYON_NUM_THREADS=1`, the same programs:
+
+```
+  wide(512, 8)                 30596    120598     46.42ms     60.72ms     60.34ms   0.76x   0.77x  yes
+  wide(2048, 8)               122372    482326    277.94ms    310.51ms    315.09ms   0.90x   0.88x  yes
+  wide(8192, 8)               489476   1929238   1540.51ms   1754.24ms   1822.31ms   0.88x   0.85x  yes
+```
+
+**`wide(8192, 8)` is the first case in the suite where a parallel backend
+beats sequential**: `par+ir` at 2.77×, `par` at 2.26×. Three things make this
+readable rather than lucky.
+
+*It is threads, not the data structures.* At one thread the same program is
+0.85× — the concurrent-structure overhead has flattened to a stable ~12–15%
+tax that no longer grows with size, exactly as the 1-thread trend above
+predicted. Everything beyond that is real parallel speedup: 1754 ms at one
+thread against 704 ms at twenty.
+
+*The crossover is a size, and it is knowable.* `par+ir` goes 0.01× → 0.05× →
+0.25× → 1.09× → 2.77× across a 256× range in `m`, breaking even just under
+`wide(2048, 8)` — call it ~100k EDB facts and ~400k tuples on this machine
+(20-core M1 Ultra). Below that the per-round fork/join toll dominates; the
+parallel column is nearly flat from `wide(32)` to `wide(512)` (203 → 254 ms
+while sequential grows 24×), which is what a fixed toll looks like.
+
+*Width is what matters, not tuple count.* `branching(12)` has 394k tuples and
+still runs at 0.30×; `wide(2048, 8)` has 482k — comparable — and reaches
+1.09×. The difference is that `branching`'s tuples are produced by a long
+serial chain of rounds over one exploding relation, while `wide`'s are
+produced by thousands of independent procedures at once. **The predictor of
+parallel payoff on this rule set is delta width per round, and delta width
+comes from the number of procedures in flight — not from how many tuples the
+analysis ends up with.**
+
+The practical conclusion changes accordingly. The parallel backends are still
+the wrong choice for anything at the scale of the paper's example, and
+`RAYON_NUM_THREADS=1` is still the setting for those. But for the workload a
+real front end would actually produce — tens of thousands of procedures with
+ordinary pointer flow and dispatch that is mostly monomorphic — parallel
+evaluation with `#![inter_rule_parallelism]` is worth turning on, and the
+speedup grows with the program.
+
+One caveat on generality: `wide` has nothing critical in it. Whether the
+critical-statement rules parallelize as well is untested, and there is reason
+to think they would do worse — the `pending`/`CritId` relations are the ones
+whose deltas come from a serial chain of propagation steps. A family that
+crosses `wide`'s width with a modest number of critical statements is the
+obvious next measurement.
 
 ### Time is not the same shape as tuple count
 
@@ -438,6 +556,9 @@ them. Each test names the property it defends:
   `path_used` all above `|P|^1.5` on `fields(n)`.
 - `access_path_depth_grows_with_call_depth` — deepest path is exactly `n+1`.
 - `recursion_through_a_field_load_terminates` — bounded `edge`, depth ≤ 1.
+- `many_procedures_cost_a_constant_each_when_nothing_is_critical` — `wide(m, 8)`
+  is linear in `m` in every relation; `critical`, `pending`, `resolve`, `top`
+  and `adequate` are empty; the `Θ(w²)` local closure leaves `pub_edge` flat.
 - `parallel_backends_derive_the_same_relations` — all three backends agree on
   five programs.
 - `a_receiver_with_no_values_stays_put_and_dispatches_nothing` — the vacuous

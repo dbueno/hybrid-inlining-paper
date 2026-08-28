@@ -18,6 +18,7 @@
 //! ```text
 //! cargo run --release --example parallel
 //! RAYON_NUM_THREADS=1 cargo run --release --example parallel   # parallel overhead alone
+//! cargo run --release --example parallel -- wide                # one family only
 //! ```
 
 use std::collections::BTreeMap;
@@ -179,8 +180,23 @@ fn main() {
     for n in [32usize, 128, 256] {
         cases.push((format!("fields_chain({n})"), fields_chain(n), 0));
     }
+    // The wide, dispatch-free case: many procedures, real flow in each, and a
+    // fixpoint whose rounds are wide rather than deep. If parallelism ever
+    // pays on this rule set, it pays here first.
+    for m in [32usize, 128, 512, 2048, 8192] {
+        cases.push((format!("wide({m}, 8)"), wide(m, 8), 0));
+    }
+    for w in [4usize, 8, 16] {
+        cases.push((format!("wide(128, {w})"), wide(128, w), 0));
+    }
 
+    // An argument filters the case list by substring, so a single family can
+    // be re-measured without paying for the slow ones.
+    let filter: Vec<String> = std::env::args().skip(1).collect();
     for (label, prog, k) in &cases {
+        if !filter.is_empty() && !filter.iter().any(|f| label.contains(f.as_str())) {
+            continue;
+        }
         show(&bench(label.clone(), prog, *k));
     }
 }

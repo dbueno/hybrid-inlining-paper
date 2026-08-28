@@ -181,6 +181,10 @@ fn main() {
                 &[2, 4, 8, 16, 32, 64], |n| (fields(n), 0)),
         measure("fields_chain(n)", "n procedures, each appending one accessor to the callee's path",
                 &[2, 4, 8, 16, 32], |n| (fields_chain(n), 0)),
+        measure("wide(m, 8)", "m procedures with a nontrivial local closure each; nothing critical",
+                &[4, 8, 16, 32, 64], |m| (wide(m, 8), 0)),
+        measure("wide(64, w)", "64 procedures, local closure of width w in each",
+                &[2, 4, 8, 16], |w| (wide(64, w), 0)),
     ];
     for f in &fams {
         report(f);

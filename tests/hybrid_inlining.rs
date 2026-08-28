@@ -6,7 +6,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hybrid_inlining_paper::access_path::{AccessPath, Accessor, Constraint, CritId, PtVal, Summary};
+use hybrid_inlining_paper::access_path::{
+    AccessPath, Accessor, Base, Constraint, CritId, PtVal, Summary,
+};
 use hybrid_inlining_paper::analysis::{HybridAnalysis, run_hybrid};
 use hybrid_inlining_paper::ir::*;
 use hybrid_inlining_paper::{families, figure1, figure5};
@@ -1796,5 +1798,149 @@ fn a_store_of_an_opaque_value_still_publishes_the_congruent_suffix() {
         rendered(&h.summaries(), "p"),
         ["ret@p ⊇ par_1@p", "ret@p.f ⊇ par_1@p.f"],
         "the mention of `.f` is what makes the congruent constraint publishable"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `free(𝔞) ∋ ret@p` — `analysis.rs:334`
+//
+// §4.1.3 defines `free(𝔞)` as "the set of variables that are accessible
+// outside the current procedure", and §2 introduces `ret@p` as one of the
+// symbolic variables that make up exactly that vocabulary. So the rule is the
+// paper's definition read literally, and `free_root` is `pub_root` modulo the
+// `can_propagate` refinement on placeholders.
+//
+// No rule in the current program ever puts a `Base::Ret` on the *sub* side of
+// an `edge`: `:182` puts `ret@p` on the sup side, and `root_map` (`:371`) and
+// `crit_map` (`:463`) have it only as a substitution *source*, never a target.
+// So `blocked` never queries `free_root` at a `Ret` base, and a rule-by-rule
+// mutation sweep finds `:334` removable with the whole suite still green.
+//
+// It is not removable, and these two tests are what say so. The first pins the
+// paper's definition; the second pins the consequence, by seeding the one
+// constraint shape the rest of the rules do not currently produce.
+//
+// Do not confuse `Base::Ret` with the paper's `ret@poly` in Figure 3(a), where
+// `foo()`'s hybrid summary is `{tx ⊇ par₁@foo, obj ⊇ par₂@foo, ret ⊇ ret@poly}`.
+// That `ret@poly` is the critical statement's *result placeholder* — this
+// analysis's `Base::CritRet` — and it does sit on the sub side (`:186`). The
+// `Ret`/`CritRet` split is the whole reason `:334` looks dead.
+// ---------------------------------------------------------------------------
+
+/// `free(𝔞)` contains `ret@p` for every procedure, per §4.1.3.
+///
+/// `ret@p` is accessible outside `p` by construction — it is the name §2 gives
+/// the value the caller receives — so it belongs to `free(𝔞)` under the
+/// paper's definition, whether or not the current rule set ever asks.
+#[test]
+fn free_root_lists_the_return_value_of_every_procedure() {
+    for prog in [figure1::program(), figure5::program()] {
+        let h = run_hybrid(&prog, 2);
+        assert!(
+            !h.known_proc.is_empty(),
+            "premise: the program has procedures"
+        );
+        for (proc_,) in &h.known_proc {
+            assert!(
+                h.free_root
+                    .contains(&(proc_.clone(), Base::Ret(proc_.clone()))),
+                "free(𝔞) must contain ret@{proc_} (§4.1.3: the variables \
+                 accessible outside the current procedure)"
+            );
+        }
+    }
+}
+
+/// A `ret@·`-rooted path in a deciding operand must block — the safety net
+/// `:334` actually is.
+///
+/// `:193` manufactures a `PtVal::Path` for *any* symbolic sub base, and
+/// `Base::Ret` is symbolic (`access_path.rs:139`). So the roots `blocked` can
+/// be queried at are `{Param, Ret, CritSlot, CritRet}`, and `free_root` has to
+/// be total over them. `:334` is what keeps the two sets aligned; without it,
+/// the day some rule puts `ret@q` on a sub side, the failure is silent.
+///
+/// The current rules never produce that shape, so this test seeds it directly
+/// — one extra `edge` tuple before `run()`, standing in for a future rule that
+/// models a callee's return as a symbolic value rather than substituting it
+/// away:
+///
+/// ```text
+/// q() {                    // uncalled, so its pendings are `stuck`
+///   Q0: m = new Arr();
+///   Q1: t = m[i];          // critical lv[v]; `i` is otherwise opaque
+/// }
+/// seeded:  i ⊇ ret@q
+/// ```
+///
+/// Nothing else symbolic reaches the index, so `⟨Q1⟩` is blocked on the
+/// strength of `ret@q` alone. Being stuck as well, it must be ⊤-summarized:
+/// `top` fires and the access resolves to `[π]`.
+///
+/// Delete `:334` and every one of those goes the other way — the instance is
+/// declared *adequate*, `index_acc` stays empty, and the load resolves to
+/// nothing at all. The analysis would silently treat a caller-visible index as
+/// dead code instead of widening it, which is the unsound direction.
+#[test]
+fn a_ret_rooted_index_blocks_the_access_it_decides() {
+    let mut prog = Program::default();
+    prog.procedure = vec![(p("q"),)];
+    prog.formal = vec![(p("q"), 0, Var::from("this@q"))];
+    prog.alloc_type = vec![(Alloc::from("lm"), Type::from("Arr"))];
+    prog.in_proc = vec![(Stmt::from("Q0"), p("q"), 0), (Stmt::from("Q1"), p("q"), 1)];
+    prog.alloc = vec![(Stmt::from("Q0"), Var::from("m"), Alloc::from("lm"))];
+    prog.load_index_var = vec![(
+        Stmt::from("Q1"),
+        Var::from("t"),
+        Var::from("m"),
+        Var::from("i"),
+    )];
+
+    let mut h = HybridAnalysis::for_program(&prog, 2);
+    // The one shape no current rule derives: `ret@q` on the sub side.
+    h.edge
+        .push((p("q"), AccessPath::var("i"), AccessPath::ret(p("q"))));
+    h.run();
+
+    let id = CritId::origin("Q1");
+    let index = AccessPath::crit_slot(id.clone(), 1);
+
+    // Premise: the index sees `ret@q` and nothing else symbolic, so `:333`,
+    // `:335` and `:337` cannot be what blocks here.
+    let symbolic: BTreeSet<Base> = h
+        .points
+        .iter()
+        .filter(|(proc_, w, _)| proc_ == &p("q") && w == &index)
+        .filter_map(|(_, _, v)| match v {
+            PtVal::Path(w) => Some(w.base.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        symbolic,
+        BTreeSet::from([Base::Ret(p("q"))]),
+        "premise: `ret@q` is the only free root reaching the index"
+    );
+    assert!(
+        h.stuck.contains(&(p("q"), id.clone())),
+        "premise: `q` has no callers, so `⟨Q1⟩` has nowhere to propagate"
+    );
+
+    assert!(
+        h.blocked.contains(&(p("q"), id.clone())),
+        "`ret@q` is in `free(𝔞)`, so the index it reaches is not yet decided"
+    );
+    assert!(
+        !h.adequate.contains(&(p("q"), id.clone())),
+        "and `Φ_a` must therefore not hold"
+    );
+    assert!(
+        h.top.contains(&(p("q"), id.clone())),
+        "blocked and stuck: the instance has to be ⊤-summarized here"
+    );
+    assert_eq!(
+        h.accessors_of(&p("q"), &id),
+        BTreeSet::from([Accessor::IndexUnknown]),
+        "so the access widens to `[π]` rather than resolving to nothing"
     );
 }

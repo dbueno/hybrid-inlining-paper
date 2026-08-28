@@ -184,8 +184,7 @@ ascent_source! { hybrid_rules:
 
     /// Suffix congruence, `ω ⊇ ω′ ⟹ ω.a ⊇ ω′.a`, applied on demand: only for
     /// suffixes some path in `p` actually mentions, so the path set stays
-    /// finite. Figure 1 has no field or index accesses, so this never fires
-    /// there.
+    /// finite.
     relation path_used(Proc, Base, AccessPath);
     path_used(p.clone(), a.base.clone(), a.clone()) <-- edge(p, a, _);
     path_used(p.clone(), b.base.clone(), b.clone()) <-- edge(p, _, b);
@@ -337,14 +336,14 @@ ascent_source! { hybrid_rules:
     relation pub_edge(Proc, AccessPath, AccessPath);
     pub_edge(p.clone(), a.clone(), b.clone()) <--
         points(p, a, ?PtVal::Path(b)),
-        let ab = a.base.clone(), pub_root(p, ab),
-        let bb = b.base.clone(), pub_root(p, bb);
+        pub_root(p, a.base),
+        pub_root(p, b.base);
 
     /// `pub_points(p, a, v)`: the `a ⊇ {l}` / `a ⊇ {c}` half of the summary.
     relation pub_points(Proc, AccessPath, PtVal);
     pub_points(p.clone(), a.clone(), v.clone()) <--
         points(p, a, v), if !v.is_path(),
-        let ab = a.base.clone(), pub_root(p, ab);
+        pub_root(p, a.base);
 
     // -- inlining a summary at a statically known callsite -----------------
 
@@ -534,6 +533,46 @@ ascent! {
     include_source!(crate::analysis::hybrid_rules);
 }
 
+/// Copy the EDB of a [`Program`] into any Ascent program that includes the
+/// [`crate::ir::edb`] source, and set its k-limit.
+///
+/// Every relation of the shared schema is named exactly once, here, so the
+/// sequential and parallel programs cannot be seeded differently.
+/// `every_edb_relation_is_copied_into_the_analysis` keeps the list from
+/// falling behind the schema.
+macro_rules! seed_edb {
+    ($target:expr, $prog:expr, $k:expr) => {{
+        let r = &mut $target;
+        let prog = $prog;
+        r.procedure = prog.procedure.clone().into_iter().collect();
+        r.proc_type = prog.proc_type.clone().into_iter().collect();
+        r.proc_sig = prog.proc_sig.clone().into_iter().collect();
+        r.entry = prog.entry.clone().into_iter().collect();
+        r.in_proc = prog.in_proc.clone().into_iter().collect();
+        r.alloc = prog.alloc.clone().into_iter().collect();
+        r.alloc_type = prog.alloc_type.clone().into_iter().collect();
+        r.const_assign = prog.const_assign.clone().into_iter().collect();
+        r.mov = prog.mov.clone().into_iter().collect();
+        r.load_field = prog.load_field.clone().into_iter().collect();
+        r.store_field = prog.store_field.clone().into_iter().collect();
+        r.load_static = prog.load_static.clone().into_iter().collect();
+        r.store_static = prog.store_static.clone().into_iter().collect();
+        r.load_index_const = prog.load_index_const.clone().into_iter().collect();
+        r.store_index_const = prog.store_index_const.clone().into_iter().collect();
+        r.load_index_var = prog.load_index_var.clone().into_iter().collect();
+        r.store_index_var = prog.store_index_var.clone().into_iter().collect();
+        r.direct_call = prog.direct_call.clone().into_iter().collect();
+        r.virtual_call = prog.virtual_call.clone().into_iter().collect();
+        r.actual_arg = prog.actual_arg.clone().into_iter().collect();
+        r.bind_ret = prog.bind_ret.clone().into_iter().collect();
+        r.formal = prog.formal.clone().into_iter().collect();
+        r.ret = prog.ret.clone().into_iter().collect();
+        r.direct_subtype = prog.direct_subtype.clone().into_iter().collect();
+        r.lookup = prog.lookup.clone().into_iter().collect();
+        r.k_limit = ::std::iter::once(($k,)).collect();
+    }};
+}
+
 impl HybridAnalysis {
     /// The analysis over `prog` with k-limit `k`, ready to `run()`.
     // Ascent generates private index fields alongside the public relation
@@ -541,37 +580,7 @@ impl HybridAnalysis {
     #[allow(clippy::field_reassign_with_default)]
     pub fn for_program(prog: &Program, k: usize) -> HybridAnalysis {
         let mut r = HybridAnalysis::default();
-
-        // Every relation of the shared `edb` schema, in declaration order.
-        // `every_edb_relation_is_copied_into_the_analysis` keeps this list
-        // from falling behind.
-        r.procedure = prog.procedure.clone();
-        r.proc_type = prog.proc_type.clone();
-        r.proc_sig = prog.proc_sig.clone();
-        r.entry = prog.entry.clone();
-        r.in_proc = prog.in_proc.clone();
-        r.alloc = prog.alloc.clone();
-        r.alloc_type = prog.alloc_type.clone();
-        r.const_assign = prog.const_assign.clone();
-        r.mov = prog.mov.clone();
-        r.load_field = prog.load_field.clone();
-        r.store_field = prog.store_field.clone();
-        r.load_static = prog.load_static.clone();
-        r.store_static = prog.store_static.clone();
-        r.load_index_const = prog.load_index_const.clone();
-        r.store_index_const = prog.store_index_const.clone();
-        r.load_index_var = prog.load_index_var.clone();
-        r.store_index_var = prog.store_index_var.clone();
-        r.direct_call = prog.direct_call.clone();
-        r.virtual_call = prog.virtual_call.clone();
-        r.actual_arg = prog.actual_arg.clone();
-        r.bind_ret = prog.bind_ret.clone();
-        r.formal = prog.formal.clone();
-        r.ret = prog.ret.clone();
-        r.direct_subtype = prog.direct_subtype.clone();
-        r.lookup = prog.lookup.clone();
-
-        r.k_limit = vec![(k,)];
+        seed_edb!(r, prog, k);
         r
     }
 
@@ -725,21 +734,70 @@ pub fn render_summary(summary: &Summary, placeholders: &BTreeSet<CritId>) -> Vec
 
 /// The same rules under Ascent's *parallel* backend.
 ///
-/// Nothing runs this — it exists so that a build fails if the program ever
-/// stops being parallelizable. The whole domain is `Arc`-backed and so
-/// `Send + Sync`, and a single fixpoint has no driver serializing it between
-/// rounds, so `ascent_par!` is a drop-in swap. Both programs include the one
-/// [`hybrid_rules`] source, so they cannot drift apart.
-#[cfg(test)]
-mod parallel {
+/// The whole domain is `Arc`-backed and so `Send + Sync`, and a single
+/// fixpoint has no driver serializing it between rounds, so `ascent_par!` is a
+/// drop-in swap. Every program here includes the one [`hybrid_rules`] source,
+/// so none of them can drift from the sequential [`HybridAnalysis`]: a build
+/// fails if the rules ever stop being parallelizable.
+///
+/// Two flavours, because Ascent parallelizes along two independent axes:
+///
+/// - [`ParallelHybridAnalysis`] — *intra*-rule only, the `ascent_par!`
+///   default: each rule's body is evaluated with a parallel iterator over the
+///   driving relation's delta, one rule at a time.
+/// - [`inter_rule::InterRuleHybridAnalysis`] — `#![inter_rule_parallelism]` on
+///   top of that, so independent rules *within one SCC* also run
+///   concurrently. This analysis has one very large SCC (stratum B), which is
+///   exactly the shape that axis is meant for.
+///
+/// `examples/parallel.rs` runs all three over the scaled families and checks
+/// that they agree tuple-for-tuple.
+pub mod parallel {
     use ascent::ascent_par;
 
     use super::*;
 
     ascent_par! {
+        /// Hybrid Inlining under `ascent_par!` with intra-rule parallelism.
         pub struct ParallelHybridAnalysis;
 
         include_source!(crate::ir::edb);
         include_source!(crate::analysis::hybrid_rules);
+    }
+
+    impl ParallelHybridAnalysis {
+        /// As [`HybridAnalysis::for_program`], seeded from the same macro.
+        #[allow(clippy::field_reassign_with_default)]
+        pub fn for_program(prog: &Program, k: usize) -> Self {
+            let mut r = Self::default();
+            seed_edb!(r, prog, k);
+            r
+        }
+    }
+
+    /// The same again, with inter-rule parallelism enabled.
+    pub mod inter_rule {
+        use ascent::ascent_par;
+
+        use super::super::*;
+
+        ascent_par! {
+            #![inter_rule_parallelism]
+            /// Hybrid Inlining with both intra- and inter-rule parallelism.
+            pub struct InterRuleHybridAnalysis;
+
+            include_source!(crate::ir::edb);
+            include_source!(crate::analysis::hybrid_rules);
+        }
+
+        impl InterRuleHybridAnalysis {
+            /// As [`HybridAnalysis::for_program`], seeded from the same macro.
+            #[allow(clippy::field_reassign_with_default)]
+            pub fn for_program(prog: &Program, k: usize) -> Self {
+                let mut r = Self::default();
+                seed_edb!(r, prog, k);
+                r
+            }
+        }
     }
 }

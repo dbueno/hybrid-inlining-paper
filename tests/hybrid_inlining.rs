@@ -1237,3 +1237,564 @@ fn every_renamed_placeholder_is_pending_in_the_procedure_it_lands_in() {
         }
     }
 }
+
+// =========================================================================
+// Milestone 7: the corners a rule-by-rule mutation sweep found uncovered
+// =========================================================================
+//
+// Each test here is pinned to rules that could be deleted outright without
+// any other test noticing. They are written against the *observable* answer
+// — a dispatch set, a points-to set, a propagation — rather than against the
+// rule, so they keep their meaning if the derivation is rearranged.
+
+/// Hybrid-in-hybrid: a resolved critical statement whose callee still carries
+/// a placeholder of its own.
+///
+/// ```text
+/// main()      { M1: g = new P(); M2: y = new Y(); M3: r = g.get(y); }  // entry
+/// P.get(x)    { G1: h = x.hop(); return h; }
+/// Q.get(x)    { return x; }                      // decoy: makes get() critical
+/// Y.hop()     { H1: yo = new Obj(); return yo; } // lyo
+/// Z.hop()     { H2: zo = new Obj(); return zo; } // lzo
+/// warm()      { W0: wo = new Obj(); W1: wt = P.get(wo); }  // gives P.get a caller
+/// ```
+///
+/// `M3`'s receiver is a local allocation, so it is pinned to `P.get` outright.
+/// `P.get` cannot decide `G1` for itself — its receiver is `par_1@P.get` — so
+/// its summary is genuinely hybrid, and inlining it at `M3` has to rename
+/// `⟨G1⟩` into `main` as `⟨G1@M3⟩`: the placeholder's slots, its result, and
+/// the pending obligation itself. Only then does `main`'s own `new Y()` reach
+/// the renamed receiver and pin `Y.hop`.
+///
+/// `warm` exists so that `P.get` is not `uncalled`: an implementation reached
+/// only through virtual calls has nowhere to propagate to, and would
+/// ⊤-summarize `G1` in place instead of publishing it as a placeholder.
+#[test]
+fn a_callee_placeholder_is_renamed_into_the_resolving_caller() {
+    let mut prog = Program::default();
+    prog.procedure = [
+        (p("P.get"),),
+        (p("Q.get"),),
+        (p("Y.hop"),),
+        (p("Z.hop"),),
+        (p("warm"),),
+        (p("main"),),
+    ]
+    .to_vec();
+    prog.entry = vec![(p("main"),), (p("warm"),)];
+    prog.lookup = vec![
+        (Type::from("P"), Sig::from("get(Obj)"), p("P.get")),
+        (Type::from("Q"), Sig::from("get(Obj)"), p("Q.get")),
+        (Type::from("Y"), Sig::from("hop()"), p("Y.hop")),
+        (Type::from("Z"), Sig::from("hop()"), p("Z.hop")),
+    ];
+    prog.alloc_type = vec![
+        (Alloc::from("lp"), Type::from("P")),
+        (Alloc::from("ly"), Type::from("Y")),
+        (Alloc::from("lyo"), Type::from("Obj")),
+        (Alloc::from("lzo"), Type::from("Obj")),
+        (Alloc::from("lw"), Type::from("Obj")),
+    ];
+    prog.formal = vec![
+        (p("P.get"), 0, Var::from("this@P")),
+        (p("P.get"), 1, Var::from("x@P")),
+        (p("Q.get"), 0, Var::from("this@Q")),
+        (p("Q.get"), 1, Var::from("x@Q")),
+        (p("Y.hop"), 0, Var::from("this@Y")),
+        (p("Z.hop"), 0, Var::from("this@Z")),
+        (p("warm"), 0, Var::from("this@warm")),
+        (p("main"), 0, Var::from("this@main")),
+    ];
+    prog.ret = vec![
+        (p("P.get"), Var::from("h")),
+        (p("Q.get"), Var::from("x@Q")),
+        (p("Y.hop"), Var::from("yo")),
+        (p("Z.hop"), Var::from("zo")),
+        (p("warm"), Var::from("wt")),
+    ];
+    prog.in_proc = vec![
+        (Stmt::from("G1"), p("P.get"), 0),
+        (Stmt::from("H1"), p("Y.hop"), 0),
+        (Stmt::from("H2"), p("Z.hop"), 0),
+        (Stmt::from("W0"), p("warm"), 0),
+        (Stmt::from("W1"), p("warm"), 1),
+        (Stmt::from("M1"), p("main"), 0),
+        (Stmt::from("M2"), p("main"), 1),
+        (Stmt::from("M3"), p("main"), 2),
+    ];
+    prog.alloc = vec![
+        (Stmt::from("H1"), Var::from("yo"), Alloc::from("lyo")),
+        (Stmt::from("H2"), Var::from("zo"), Alloc::from("lzo")),
+        (Stmt::from("W0"), Var::from("wo"), Alloc::from("lw")),
+        (Stmt::from("M1"), Var::from("g"), Alloc::from("lp")),
+        (Stmt::from("M2"), Var::from("y"), Alloc::from("ly")),
+    ];
+    prog.virtual_call = vec![
+        (Stmt::from("G1"), Var::from("x@P"), Sig::from("hop()")),
+        (Stmt::from("M3"), Var::from("g"), Sig::from("get(Obj)")),
+    ];
+    prog.direct_call = vec![(Stmt::from("W1"), p("P.get"))];
+    prog.actual_arg = vec![
+        (Stmt::from("G1"), 0, Var::from("x@P")),
+        (Stmt::from("W1"), 0, Var::from("this@warm")),
+        (Stmt::from("W1"), 1, Var::from("wo")),
+        (Stmt::from("M3"), 0, Var::from("g")),
+        (Stmt::from("M3"), 1, Var::from("y")),
+    ];
+    prog.bind_ret = vec![
+        (Stmt::from("G1"), Var::from("h")),
+        (Stmt::from("W1"), Var::from("wt")),
+        (Stmt::from("M3"), Var::from("r")),
+    ];
+
+    let h = run_hybrid(&prog, 4);
+    let outer = CritId::origin("M3");
+    let inner = CritId::origin("G1");
+    let nested = inner.nest(&outer); // ⟨G1@M3⟩
+
+    // The premise: `P.get` publishes `G1` rather than deciding it.
+    assert_eq!(
+        h.placeholders(&p("P.get")),
+        BTreeSet::from([inner.clone()]),
+        "P.get's summary must still defer G1"
+    );
+    assert!(
+        h.top.iter().all(|(owner, _)| owner != &p("P.get")),
+        "G1 must not be ⊤-summarized inside P.get: {:?}",
+        h.top
+    );
+
+    // The outer statement is pinned by a local allocation.
+    assert_eq!(
+        h.callees_of(&p("main"), &outer),
+        BTreeSet::from([p("P.get")])
+    );
+
+    // ... and inlining P.get renames its placeholder into `main`.
+    assert!(
+        h.pending.contains(&(p("main"), nested.clone())),
+        "⟨G1@M3⟩ must be pending in main: {:?}",
+        h.pending
+    );
+
+    // Now `main` has the context P.get lacked: `new Y()` reaches the renamed
+    // receiver, so `Z.hop` is never admitted.
+    assert_eq!(
+        h.callees_of(&p("main"), &nested),
+        BTreeSet::from([p("Y.hop")]),
+        "the nested instance must dispatch on what main actually passes"
+    );
+
+    // And the value comes back out through the renamed result node.
+    assert_eq!(pt(&h, "main", "r"), set(&["{lyo}"]));
+}
+
+/// The two non-k-limit ways of being [`stuck`]: an entry procedure, whose
+/// callers the analysis cannot see, and a procedure with no callers at all.
+///
+/// ```text
+/// launcher()      { L1: a = new Obj(); L2: t = root(a); }   // entry
+/// root(arg)       { R1: q = arg.poly(); return q; }         // entry *and* called
+/// orphan(o)       { O1: s = o.poly();  return s; }          // neither
+/// Y.poly() { Y1: yv = new Obj(); return yv; }
+/// Z.poly() { Z1: zv = new Obj(); return zv; }
+/// ```
+///
+/// Both `R1` and `O1` are blocked — their receivers are formals, so a caller
+/// still controls them — and both are far from the k-limit. What forces them
+/// to ⊤-summarize on the spot is the other half of `stuck`: `root` is an
+/// entry, so the caller that would pin `R1` may not be in the program at all;
+/// `orphan` has no callers, so a placeholder propagated out of it would never
+/// come back. The two procedures separate the two rules: `root` is called and
+/// so is not `uncalled`, `orphan` is not an entry.
+#[test]
+fn an_entry_and_an_uncalled_procedure_both_top_summarize_in_place() {
+    let mut prog = Program::default();
+    prog.procedure = [
+        (p("launcher"),),
+        (p("root"),),
+        (p("orphan"),),
+        (p("Y.poly"),),
+        (p("Z.poly"),),
+    ]
+    .to_vec();
+    prog.entry = vec![(p("launcher"),), (p("root"),)];
+    prog.lookup = vec![
+        (Type::from("Y"), Sig::from("poly()"), p("Y.poly")),
+        (Type::from("Z"), Sig::from("poly()"), p("Z.poly")),
+    ];
+    prog.alloc_type = vec![
+        (Alloc::from("lo"), Type::from("Obj")),
+        (Alloc::from("lyv"), Type::from("Obj")),
+        (Alloc::from("lzv"), Type::from("Obj")),
+    ];
+    prog.formal = vec![
+        (p("launcher"), 0, Var::from("this@launcher")),
+        (p("root"), 0, Var::from("this@root")),
+        (p("root"), 1, Var::from("arg@root")),
+        (p("orphan"), 0, Var::from("this@orphan")),
+        (p("orphan"), 1, Var::from("o@orphan")),
+        (p("Y.poly"), 0, Var::from("this@Y")),
+        (p("Z.poly"), 0, Var::from("this@Z")),
+    ];
+    prog.ret = vec![
+        (p("root"), Var::from("q")),
+        (p("orphan"), Var::from("s")),
+        (p("Y.poly"), Var::from("yv")),
+        (p("Z.poly"), Var::from("zv")),
+    ];
+    prog.in_proc = vec![
+        (Stmt::from("L1"), p("launcher"), 0),
+        (Stmt::from("L2"), p("launcher"), 1),
+        (Stmt::from("R1"), p("root"), 0),
+        (Stmt::from("O1"), p("orphan"), 0),
+        (Stmt::from("Y1"), p("Y.poly"), 0),
+        (Stmt::from("Z1"), p("Z.poly"), 0),
+    ];
+    prog.alloc = vec![
+        (Stmt::from("L1"), Var::from("a"), Alloc::from("lo")),
+        (Stmt::from("Y1"), Var::from("yv"), Alloc::from("lyv")),
+        (Stmt::from("Z1"), Var::from("zv"), Alloc::from("lzv")),
+    ];
+    prog.virtual_call = vec![
+        (Stmt::from("R1"), Var::from("arg@root"), Sig::from("poly()")),
+        (Stmt::from("O1"), Var::from("o@orphan"), Sig::from("poly()")),
+    ];
+    prog.direct_call = vec![(Stmt::from("L2"), p("root"))];
+    prog.actual_arg = vec![
+        (Stmt::from("R1"), 0, Var::from("arg@root")),
+        (Stmt::from("O1"), 0, Var::from("o@orphan")),
+        (Stmt::from("L2"), 0, Var::from("this@launcher")),
+        (Stmt::from("L2"), 1, Var::from("a")),
+    ];
+    prog.bind_ret = vec![
+        (Stmt::from("R1"), Var::from("q")),
+        (Stmt::from("O1"), Var::from("s")),
+        (Stmt::from("L2"), Var::from("t")),
+    ];
+
+    let k = 3;
+    let h = run_hybrid(&prog, k);
+    let r1 = CritId::origin("R1");
+    let o1 = CritId::origin("O1");
+    let both = BTreeSet::from([p("Y.poly"), p("Z.poly")]);
+
+    // Neither instance is anywhere near the k-limit, so that branch of
+    // `stuck` cannot be what decides either of them.
+    assert!(r1.depth() < k && o1.depth() < k);
+
+    // `root` is an entry that also has a visible caller: being called is not
+    // enough, because the callers an entry has are not all visible.
+    assert!(
+        !h.uncalled.contains(&(p("root"),)),
+        "launcher calls root, so root is not uncalled"
+    );
+    assert!(h.blocked.contains(&(p("root"), r1.clone())));
+    assert!(
+        h.top.contains(&(p("root"), r1.clone())),
+        "an entry's blocked placeholder must ⊤-summarize where it stands"
+    );
+    assert_eq!(h.callees_of(&p("root"), &r1), both);
+
+    // `orphan` is not an entry, but nothing calls it either, so a propagated
+    // placeholder would never find a caller to pin it.
+    assert!(h.uncalled.contains(&(p("orphan"),)));
+    assert!(h.blocked.contains(&(p("orphan"), o1.clone())));
+    assert!(
+        h.top.contains(&(p("orphan"), o1.clone())),
+        "a procedure with no callers must ⊤-summarize its blocked placeholders"
+    );
+    assert_eq!(h.callees_of(&p("orphan"), &o1), both);
+}
+
+/// A procedure the EDB only mentions in passing still gets summarized.
+///
+/// `procedure` is the front end's list of bodies it chose to declare; the
+/// analysis takes `in_proc` as equally good evidence that a procedure exists,
+/// so that a partial or hand-written EDB cannot silently lose a summary. Here
+/// `hidden` is absent from `procedure` but has a body, and without it the
+/// caller would see nothing come back.
+#[test]
+fn a_procedure_only_in_proc_names_still_publishes_a_summary() {
+    let mut prog = Program::default();
+    prog.procedure = vec![(p("main"),)]; // deliberately omits `hidden`
+    prog.entry = vec![(p("main"),)];
+    prog.alloc_type = vec![(Alloc::from("lo"), Type::from("Obj"))];
+    prog.formal = vec![
+        (p("main"), 0, Var::from("this@main")),
+        (p("hidden"), 0, Var::from("this@hidden")),
+        (p("hidden"), 1, Var::from("x@hidden")),
+    ];
+    prog.ret = vec![(p("hidden"), Var::from("t"))];
+    prog.in_proc = vec![
+        (Stmt::from("H1"), p("hidden"), 0),
+        (Stmt::from("M1"), p("main"), 0),
+        (Stmt::from("M2"), p("main"), 1),
+    ];
+    prog.mov = vec![(Stmt::from("H1"), Var::from("t"), Var::from("x@hidden"))];
+    prog.alloc = vec![(Stmt::from("M1"), Var::from("o"), Alloc::from("lo"))];
+    prog.direct_call = vec![(Stmt::from("M2"), p("hidden"))];
+    prog.actual_arg = vec![
+        (Stmt::from("M2"), 0, Var::from("this@main")),
+        (Stmt::from("M2"), 1, Var::from("o")),
+    ];
+    prog.bind_ret = vec![(Stmt::from("M2"), Var::from("r"))];
+
+    let h = run_hybrid(&prog, 2);
+
+    assert!(
+        h.known_proc.contains(&(p("hidden"),)),
+        "in_proc names `hidden`, which is enough to make it a known procedure"
+    );
+    assert_eq!(
+        rendered(&h.summaries(), "hidden"),
+        ["ret@hidden ⊇ par_1@hidden"]
+    );
+    assert_eq!(pt(&h, "main", "r"), set(&["{lo}"]));
+}
+
+/// The value slot of a pending `lv[v]` *store* is part of `free(𝔞)`, and so
+/// blocks anything downstream of it, for as long as that store can still
+/// propagate.
+///
+/// ```text
+/// p() {                       // called from main, so its pendings can propagate
+///   P0: m = new Arr();
+///   P1: k = "key";
+///   Pv: v = new Y();
+///   P2: m[k] = v;             // critical store ⟨P2⟩ — a variable index
+///   P3: t = m["key"];         // a *constant* index: not critical
+///   P4: r = t.poly();         // critical call ⟨P4⟩
+///   return r;
+/// }
+/// main() { M1: out = p(); }   // entry
+/// ```
+///
+/// `t` is read back out of the array the store wrote, so the only symbolic
+/// member of `⟨P4⟩`'s receiver set is `⟨P2⟩:arg2` — the store's value slot.
+/// That is the one root `free_root` can supply here, and it is what makes
+/// `⟨P4⟩` blocked and sends it up to `main`.
+///
+/// # OPEN QUESTION — this test pins behaviour that may be wrong
+///
+/// Note what the guard is: `can_propagate` (`analysis.rs:278`), not adequacy.
+/// `⟨P2⟩`'s index is a local constant, so the store is adequate, settled, and
+/// will never move — the propagation rules (`:267`, `:377`, `:380`) all carry a
+/// `blocked` guard that `can_propagate` never picked up. So `⟨P2⟩:arg2` is
+/// declared caller-influenced even though everything it holds is local, and
+/// `⟨P4⟩` is blocked as a result.
+///
+/// Measured on this program, with `free_root`'s `CritSlot` rule
+/// (`analysis.rs:335`) removed and nothing else changed:
+///
+/// ```text
+///                     with :335                without :335
+///   ⟨P4⟩ blocked      true                     false
+///   ⟨P4⟩ settled      false                    true
+///   pending           p:⟨P2⟩ p:⟨P4⟩             p:⟨P2⟩ p:⟨P4⟩
+///                     main:⟨P4@M1⟩              (no copy in main)
+///   placeholders(p)   [⟨P4⟩]                   []
+///   summary(p)        ret@p ⊇ ⟨P4⟩:res         ret@p ⊇ {lyv}
+///                     ret@p ⊇ {lyv}
+///                     ⟨P4⟩:arg0 ⊇ {ly}
+///                     ⟨P4⟩:res ⊇ {lyv}
+/// ```
+///
+/// Dispatch is `Y.poly` either way — `resolve` (`:424`) fires on the
+/// allocation regardless of `blocked`. What the rule costs is a spurious
+/// pending in every caller, a placeholder reported as deferred that isn't, and
+/// three constraints of placeholder plumbing kept in the published summary
+/// instead of collapsed away.
+///
+/// Two neighbouring shapes, measured, suggest the rule may never do necessary
+/// work — that it adds blocking only where blocking is wrong:
+///
+/// - `P2: m[k] = par` (value from a parameter): `⟨P4⟩` is blocked, and
+///   rightly, but `pt(t) = {par_1@p}` — the parameter arrives in the receiver's
+///   set by ordinary closure, so `free_root`'s *`Param`* rule (`:333`) already
+///   blocks it. `:335` fires redundantly.
+/// - `P2: m[par] = v` (index from a parameter): an unpinned index yields no
+///   `index_acc`, so `:496`/`:511` never fire, nothing reaches `t`, and `⟨P4⟩`
+///   is untouched. `⟨P2⟩` itself is blocked and propagates, as it should.
+///
+/// The conjecture, *not proven*: whatever a slot holds reaches its readers by
+/// closure (`:187`), so genuinely caller-influenced content always arrives as a
+/// `Param`-rooted path (blocks via `:333`) or a `CritRet`-rooted one (blocks
+/// via `:337`) on its own. `:335` contributes only the placeholder root, which
+/// carries no caller influence the closure has not already delivered. Settling
+/// it means enumerating what can reach a decisive slot from the only base case
+/// that puts a `CritSlot` on the sub side of an edge — the `lv[v]` store
+/// resolution `:496`/`:511`, slot 2 specifically; every other occurrence is
+/// renaming (`:377`, `:466`) — the way `rule-57-to-check.md` does for `Ret`.
+///
+/// The candidate fix is to give `can_propagate` the guard its siblings have:
+///
+/// ```text
+/// can_propagate(p, id) <-- pending(p, id), blocked(p, id), eff_direct(s, p),
+///                          in_proc(s, _, _), k_limit(k), if id.depth() < *k;
+/// ```
+///
+/// It stays positive and monotone, so it remains legal inside the SCC. The
+/// thing to watch is the cycle it introduces —
+/// `blocked → can_propagate → free_root → blocked`. The least fixpoint is
+/// still well defined and the bootstrap survives (`:333`/`:334` are
+/// unconditional), but a blocking chain grounded *only* in placeholder slots
+/// would then collapse to nothing. That is the intended effect, and the part
+/// worth a deliberate test of its own.
+///
+/// Until that is settled, this test pins the guard as written, so that
+/// tightening it is a visible change rather than a silent one.
+#[test]
+fn a_pending_stores_value_slot_blocks_what_reads_it_back() {
+    let mut prog = Program::default();
+    prog.procedure = [(p("p"),), (p("main"),), (p("Y.poly"),), (p("Z.poly"),)].to_vec();
+    prog.entry = vec![(p("main"),)];
+    prog.lookup = vec![
+        (Type::from("Y"), Sig::from("poly()"), p("Y.poly")),
+        (Type::from("Z"), Sig::from("poly()"), p("Z.poly")),
+    ];
+    prog.alloc_type = vec![
+        (Alloc::from("lm"), Type::from("Arr")),
+        (Alloc::from("ly"), Type::from("Y")),
+        (Alloc::from("lyv"), Type::from("Obj")),
+        (Alloc::from("lzv"), Type::from("Obj")),
+    ];
+    prog.formal = vec![
+        (p("p"), 0, Var::from("this@p")),
+        (p("main"), 0, Var::from("this@main")),
+        (p("Y.poly"), 0, Var::from("this@Y")),
+        (p("Z.poly"), 0, Var::from("this@Z")),
+    ];
+    prog.ret = vec![
+        (p("p"), Var::from("r")),
+        (p("Y.poly"), Var::from("yv")),
+        (p("Z.poly"), Var::from("zv")),
+    ];
+    prog.in_proc = vec![
+        (Stmt::from("P0"), p("p"), 0),
+        (Stmt::from("P1"), p("p"), 1),
+        (Stmt::from("Pv"), p("p"), 2),
+        (Stmt::from("P2"), p("p"), 3),
+        (Stmt::from("P3"), p("p"), 4),
+        (Stmt::from("P4"), p("p"), 5),
+        (Stmt::from("M1"), p("main"), 0),
+        (Stmt::from("Y1"), p("Y.poly"), 0),
+        (Stmt::from("Z1"), p("Z.poly"), 0),
+    ];
+    prog.alloc = vec![
+        (Stmt::from("P0"), Var::from("m"), Alloc::from("lm")),
+        (Stmt::from("Pv"), Var::from("v"), Alloc::from("ly")),
+        (Stmt::from("Y1"), Var::from("yv"), Alloc::from("lyv")),
+        (Stmt::from("Z1"), Var::from("zv"), Alloc::from("lzv")),
+    ];
+    prog.const_assign = vec![(Stmt::from("P1"), Var::from("k"), Const::from("key"))];
+    prog.store_index_var = vec![(
+        Stmt::from("P2"),
+        Var::from("m"),
+        Var::from("k"),
+        Var::from("v"),
+    )];
+    prog.load_index_const = vec![(
+        Stmt::from("P3"),
+        Var::from("t"),
+        Var::from("m"),
+        Const::from("key"),
+    )];
+    prog.virtual_call = vec![(Stmt::from("P4"), Var::from("t"), Sig::from("poly()"))];
+    prog.direct_call = vec![(Stmt::from("M1"), p("p"))];
+    prog.actual_arg = vec![
+        (Stmt::from("P4"), 0, Var::from("t")),
+        (Stmt::from("M1"), 0, Var::from("this@main")),
+    ];
+    prog.bind_ret = vec![
+        (Stmt::from("P4"), Var::from("r")),
+        (Stmt::from("M1"), Var::from("out")),
+    ];
+
+    let h = run_hybrid(&prog, 3);
+    let call = CritId::origin("P4");
+    let store = CritId::origin("P2");
+
+    // The premise: the store's value slot is what the receiver reads back.
+    assert!(
+        h.points.contains(&(
+            p("p"),
+            AccessPath::crit_slot(call.clone(), 0),
+            PtVal::Path(AccessPath::crit_slot(store.clone(), 2)),
+        )),
+        "the receiver should see the store's value slot"
+    );
+    assert!(
+        h.can_propagate.contains(&(p("p"), store.clone())),
+        "premise: the store instance can still travel"
+    );
+
+    // So the call is blocked, even though nothing symbolic reaches it by any
+    // other route, and it travels to `main` instead of settling in `p`.
+    assert!(
+        h.blocked.contains(&(p("p"), call.clone())),
+        "a free placeholder slot in the receiver's set must block"
+    );
+    assert!(
+        h.pending
+            .contains(&(p("main"), call.push(&Stmt::from("M1")))),
+        "a blocked instance propagates: {:?}",
+        h.pending
+    );
+    assert!(
+        h.placeholders(&p("p")).contains(&call),
+        "and it is still reported as deferred in p"
+    );
+}
+
+/// Suffix congruence keys off the suffixes a procedure *mentions*, not off the
+/// suffixes that happen to carry values.
+///
+/// ```text
+/// p(par) { S1: a = par; S2: a.f = c; return a; }   // `c` is opaque: nothing
+///                                                  // in the EDB defines it
+/// ```
+///
+/// `a.f` is written and never read, and what is written to it has no
+/// points-to set at all — the shape a front end produces for a value it
+/// cannot model, such as the result of a native call. So `a.f` is nowhere on
+/// the receiving end of a constraint and holds nothing: the only evidence
+/// that `.f` is a suffix worth closing over is that a constraint *mentions*
+/// it on the left.
+///
+/// That is enough. `ret@p ⊇ a` and `a ⊇ par_1@p`, closed under `.f`, give
+/// `ret@p.f ⊇ par_1@p.f`, and the caller needs it: `p` hands back the very
+/// object it was given, so a field of the result is a field of the argument.
+#[test]
+fn a_store_of_an_opaque_value_still_publishes_the_congruent_suffix() {
+    let mut prog = Program::default();
+    prog.procedure = vec![(p("p"),)];
+    prog.formal = vec![
+        (p("p"), 0, Var::from("this@p")),
+        (p("p"), 1, Var::from("par@p")),
+    ];
+    prog.ret = vec![(p("p"), Var::from("a"))];
+    prog.in_proc = vec![(Stmt::from("S1"), p("p"), 0), (Stmt::from("S2"), p("p"), 1)];
+    prog.mov = vec![(Stmt::from("S1"), Var::from("a"), Var::from("par@p"))];
+    prog.store_field = vec![(
+        Stmt::from("S2"),
+        Var::from("a"),
+        Field::from("f"),
+        Var::from("c"),
+    )];
+
+    let h = run_hybrid(&prog, 2);
+
+    // The premise: what is stored has no points-to set of its own, so `a.f`
+    // has no content except whatever congruence gives it.
+    assert!(
+        h.points_to(&p("p"), "c").is_empty(),
+        "premise: the stored value is opaque"
+    );
+
+    assert_eq!(
+        rendered(&h.summaries(), "p"),
+        ["ret@p ⊇ par_1@p", "ret@p.f ⊇ par_1@p.f"],
+        "the mention of `.f` is what makes the congruent constraint publishable"
+    );
+}

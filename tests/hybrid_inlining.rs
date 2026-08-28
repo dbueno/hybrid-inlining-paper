@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use hybrid_inlining_paper::access_path::{AccessPath, Accessor, Constraint, CritId, PtVal, Summary};
 use hybrid_inlining_paper::analysis::{HybridAnalysis, run_hybrid};
 use hybrid_inlining_paper::ir::*;
-use hybrid_inlining_paper::{figure1, figure5};
+use hybrid_inlining_paper::{families, figure1, figure5};
 
 fn p(x: &str) -> Proc {
     x.into()
@@ -1138,4 +1138,102 @@ fn a_cascade_of_decisions_is_one_fixpoint() {
         N,
         "exactly one callee per site: no ⊤ fan-out anywhere in the cascade"
     );
+}
+
+// =========================================================================
+// The vacuous corner of adequacy: a deciding operand with no values at all
+// =========================================================================
+
+/// `blocked` is a *presence* test — "some path the caller controls reaches the
+/// deciding operand" — so a deciding operand whose points-to set is **empty**
+/// is vacuously unblocked, and propagation's `blocked` guard keeps the
+/// instance where it is.
+///
+/// That is the right answer, and this test pins why. By the `is_symbolic`
+/// seeding rule (`points(p, sup, Path(sub)) <-- edge(p, sup, sub)` when `sub`
+/// is symbolic), an operand fed by a parameter, or by a field of one, or by
+/// any other caller-reachable path, carries a symbolic member and so *is*
+/// blocked. An empty set therefore means no reaching definition of any kind:
+/// dead code. Propagating it would produce an equally empty placeholder in
+/// every caller — `V`'s summary publishes nothing for the operand, so the
+/// child would have nothing to decide with either.
+#[test]
+fn a_receiver_with_no_values_stays_put_and_dispatches_nothing() {
+    let h = run_hybrid(&families::dead_receiver(), 4);
+    let id = CritId::origin("S");
+
+    // The premise: nothing whatsoever reaches the deciding operand.
+    assert!(
+        h.points_to_path(&p("V"), &AccessPath::crit_slot(id.clone(), 0))
+            .is_empty(),
+        "premise: pt(receiver) should be empty"
+    );
+
+    // So the instance is adequate — vacuously — and stays in `V`.
+    assert!(
+        h.pending.contains(&(p("V"), id.clone())),
+        "the instance should still be pending in V"
+    );
+    assert!(
+        !h.blocked.contains(&(p("V"), id.clone())),
+        "an empty deciding operand cannot be blocked"
+    );
+    assert!(
+        h.pending.iter().all(|(owner, _)| owner == &p("V")),
+        "nothing should propagate to Entry: {:?}",
+        h.pending
+    );
+
+    // Nothing is claimed about it: no callee, and no ⊤ fan-out either.
+    assert!(
+        h.dispatches().is_empty(),
+        "dead code must not admit call edges: {:?}",
+        h.dispatches()
+    );
+    assert!(
+        h.top.is_empty(),
+        "an unblocked instance is never ⊤-summarized: {:?}",
+        h.top
+    );
+
+    // And it is reported honestly: still deferred in `V`, invisible in `Entry`.
+    assert_eq!(h.placeholders(&p("V")), BTreeSet::from([id]));
+    assert!(h.placeholders(&p("Entry")).is_empty());
+}
+
+/// The guard on propagation and the guard on the placeholder renaming in
+/// `root_map` must agree, or a caller ends up holding constraint-graph nodes
+/// rooted at a placeholder it never lists as pending — an obligation with no
+/// owner, invisible to `placeholders()` and unreachable by `resolve`.
+///
+/// This is the structural invariant, checked over every family that has
+/// critical statements at all: if a callsite in `q` renames a placeholder into
+/// `q`, then `q` holds the renamed instance as pending.
+#[test]
+fn every_renamed_placeholder_is_pending_in_the_procedure_it_lands_in() {
+    let cases: Vec<(&str, Program, usize)> = vec![
+        ("figure1", figure1::program(), 4),
+        ("figure5", figure5::program(), 4),
+        ("chain(4)", families::chain(4, 2), 6),
+        ("fanin(4)", families::fanin(4, 2), 3),
+        ("branching(3)", families::branching(3, 2), 5),
+        ("dead_receiver", families::dead_receiver(), 4),
+    ];
+    for (label, prog, k) in &cases {
+        let h = run_hybrid(prog, *k);
+        let pending: BTreeSet<(Proc, CritId)> = h.pending.iter().cloned().collect();
+        for (site, _, to) in &h.root_map {
+            let Some(id) = to.crit_id() else { continue };
+            for (s, owner, _) in &h.in_proc {
+                if s != site {
+                    continue;
+                }
+                assert!(
+                    pending.contains(&(owner.clone(), id.clone())),
+                    "{label}: {site} renames a placeholder to {id} in {owner}, \
+                     but {owner} does not hold it as pending"
+                );
+            }
+        }
+    }
 }

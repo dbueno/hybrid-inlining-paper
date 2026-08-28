@@ -26,18 +26,24 @@ decides).
 
 | relation | size | | relation | size |
 |---|---|---|---|---|
-| `path_used` | 71 | | `pending` | 6 |
-| `points` | 63 | | `call_crit` / `crit_sig` / `decisive_slot` | 6 |
-| `edge` | 47 | | `eff_direct` | 6 |
-| `pub_root` | 43 | | `is_called` | 5 |
-| `free_root` | 37 | | `adequate` / `can_propagate` / `resolve` / `settled` | 4 |
-| `root_map` | 36 | | `uncalled` | 3 |
-| `pub_edge` | 17 | | `blocked` / `sig_target` / `stuck` | 2 |
-| `crit_map` / `crit_operand` | 12 | | `crit_origin` / `critical` / `sig_size` | 1 |
-| `pub_points` | 11 | | | |
+| `path_used` | 65 | | `crit_operand` / `known_proc` | 8 |
+| `points` | 53 | | `crit_map` / `eff_direct` | 6 |
+| `edge` | 40 | | `is_called` / `pub_points` | 5 |
+| `free_root` / `pub_root` | 37 | | `call_crit` / `can_propagate` / `crit_sig` / `decisive_slot` / `pending` | 4 |
+| `root_map` | 30 | | `uncalled` | 3 |
+| `pub_edge` | 16 | | `adequate` / `blocked` / `resolve` / `settled` / `sig_target` | 2 |
+| | | | `crit_origin` / `critical` / `sig_size` | 1 |
 
-520 derived tuples for 82 input facts — a factor of 6, and nothing here is
-large enough for asymptotics to show. That is what the families are for.
+352 tuples in the derived relations above — 452 across every relation the
+program declares, which is the basis the `tuples` column of the parallel table
+below uses. Either way nothing here is large enough for asymptotics to show.
+That is what the families are for.
+
+`resolve = 2` is the entire dispatch answer: `bar1 → Y.poly` and
+`bar2 → Z.poly`, one tuple each, with the spurious `bar1 → Z.poly` absent. It
+used to be 4, and the two that went away were not call edges — they were child
+instances in `service` re-deciding what `bar1` and `bar2` had already decided.
+The section on the `blocked` guard below is why they are gone.
 
 ## The short answer
 
@@ -157,8 +163,12 @@ it does contain it. The same programs with `k` held at 3:
 ```
 
 Flat past `d = k`, and everything else with it. **The k-limit is the only
-thing standing between this analysis and an exponential**; there is no other
-brake in the rules.
+thing standing between this analysis and an exponential.** The one other brake
+in the rules — the `blocked` guard on propagation, below — prunes placeholders
+that are already *decided*, and `branching(d)`'s are not: its receiver comes
+from the top, so every intermediate holder is genuinely blocked and every one
+of those `2^d` call strings is a distinct undecided obligation. Nothing but `k`
+touches those.
 
 Two other things worth knowing about that. First, the cost of capping is paid
 in ⊤-summarization: at `k = 3`, `top` goes from 0 to 8 at `d = 3` and
@@ -167,6 +177,56 @@ in ⊤-summarization: at `k = 3`, `top` goes from 0 to 8 at `d = 3` and
 in every relation, and so is `fanin(m)`, one critical procedure called from
 `m` distinct callers. Depth alone is free, fan-in alone is free; it is the
 number of distinct call *paths* that multiplies.
+
+## What `pending` counts, and what the `blocked` guard removes
+
+A placeholder crosses a callsite only while it is `blocked` — while the caller
+still controls the operand that decides it:
+
+```
+pending(q, id.push(s)) <-- pending(p, id), blocked(p, id), eff_direct(s, p), … ;
+```
+
+`root_map`'s two placeholder-renaming rules carry the same guard, so a
+procedure and its callers agree on which instances cross. The justification is
+the paper's adequacy condition read as a *presence* test: an adequate instance
+has a points-to set for its deciding operand that no caller can add to, because
+any caller-reachable component would appear as a symbolic path — that is what
+`points(p, sup, Path(sub)) <-- edge(p, sup, sub)`, for symbolic `sub`, is for —
+and would therefore block. So an adequate instance is decided where it stands,
+and a propagated copy re-derives the same callees. `blocked` only ever grows,
+so the guard is monotone and needs no new stratum.
+
+What it removes is duplication, and it is a constant factor:
+
+| | before | after |
+|---|---|---|
+| `figure1`, all relations | 520 | **452** |
+| `figure1`, `resolve` | 4 | **2** |
+| `fanin(32)`, all relations | 4261 | **3173** |
+| `fanin(32)`, `pending` | 65 | **33** |
+
+(All-relation totals on the same basis as the `tuples` column of the parallel
+table below, so the two sections can be read against each other.)
+
+`fanin` is where it bites: each caller allocates and pins its own receiver, so
+the instance is adequate at the caller and has no business climbing to `Entry`.
+
+What it does **not** remove is a single call string. `chain(n)` and
+`branching(d)` are unchanged tuple for tuple, because their receiver is supplied
+from the top and every intermediate holder is genuinely blocked; `pending` on
+`branching(d)` is still exactly `3·2^d − 1`. **The guard prunes *decided*
+placeholders. The exponential is made of undecided ones, and only `k` bounds
+those.**
+
+One corner is worth naming, because `blocked` is a presence test: a deciding
+operand whose points-to set is **empty** is vacuously unblocked, so the guard
+keeps the instance where it is. That is the right answer — by the seeding rule
+an operand fed by a parameter, or by a field of one, carries a symbolic member
+and blocks, so an empty set means no reaching definition of any kind, i.e. dead
+code — and propagating it would only manufacture equally empty placeholders in
+every caller. `families::dead_receiver()` is the program, and
+`a_receiver_with_no_values_stays_put_and_dispatches_nothing` pins the behaviour.
 
 ## What tuple counts hide: access-path depth
 
@@ -242,40 +302,42 @@ It is now a real, runnable program, seeded by the same `seed_edb!` macro as the
 sequential one so the three cannot be given different inputs.
 `examples/parallel.rs` checks every backend's relation sizes against the
 sequential ones on every case — the `agree` column below — so this is a
-correctness test as much as a timing one. **All three agree everywhere.**
+correctness test as much as a timing one. **All three agree everywhere**, which
+is also the differential check that the `blocked` guard on propagation derives
+the same relations under all three evaluators.
 
 ### The result: parallelism loses, badly — and more threads make it worse
 
 20 rayon threads, `--release`, best-of within a 750 ms budget per case.
 
 ```
-  case                           |P|    tuples         seq         par      par+ir    par×     ir×
-  figure1, k = 4                  82       520      0.56ms    237.61ms    146.83ms   0.00x   0.00x
-  chain(8), k = n+2              122       779      0.39ms    384.08ms    225.93ms   0.00x   0.00x
-  chain(32), k = n+2             386      2507      2.54ms   1248.90ms    733.94ms   0.00x   0.00x
-  chain(128), k = n+2           1442      9419     42.52ms   5067.20ms   3263.11ms   0.01x   0.01x
-  chain(512), k = n+2           5666     37067   1454.96ms  25518.22ms  15546.54ms   0.06x   0.09x
-  fanin(8), k = 3                162      1177      0.37ms    194.16ms    114.22ms   0.00x   0.00x
-  fanin(32), k = 3               570      4261      1.28ms    199.27ms    127.32ms   0.01x   0.01x
-  fanin(128), k = 3             2202     16597      4.94ms    223.34ms    137.80ms   0.02x   0.04x
-  fanin(512), k = 3             8730     65941     21.40ms    288.10ms    202.79ms   0.07x   0.11x
-  branching(6), k = d+2          142      6587      3.08ms    383.85ms    247.06ms   0.01x   0.01x
-  branching(8), k = d+2          178     25131     13.05ms    541.11ms    343.30ms   0.02x   0.04x
-  branching(10), k = d+2         214     98971     63.69ms    897.79ms    614.74ms   0.07x   0.10x
-  branching(12), k = d+2         250    393995    329.65ms   1890.53ms   1497.50ms   0.17x   0.22x
-  alias(64)                      385      2991      1.05ms    689.50ms    463.37ms   0.00x   0.00x
-  alias(256)                    1537     36495     15.41ms   2652.30ms   1711.23ms   0.01x   0.01x
-  alias(512)                    3073    138511     64.17ms   4285.40ms   2905.10ms   0.01x   0.02x
-  fields(16)                      38       584      1.23ms    460.08ms    320.01ms   0.00x   0.00x
-  fields(32)                      70      1904      8.73ms    893.47ms    590.01ms   0.01x   0.01x
-  fields(64)                     134      6848     92.12ms   2092.09ms   1598.67ms   0.04x   0.06x
-  fields_chain(32)               367      1762      2.47ms   2748.42ms   1954.83ms   0.00x   0.00x
-  fields_chain(128)             1423      6850     20.56ms  11689.65ms   7597.57ms   0.00x   0.00x
-  fields_chain(256)             2831     13634     75.18ms  22890.16ms  15131.47ms   0.00x   0.00x
+  case                           |P|    tuples         seq         par      par+ir    par×     ir×  agree
+  figure1, k = 4                  82       452      0.47ms    298.10ms    190.75ms   0.00x   0.00x  yes
+  chain(8), k = n+2              122       779      0.41ms    513.39ms    311.48ms   0.00x   0.00x  yes
+  chain(32), k = n+2             386      2507      2.67ms   1599.67ms    953.23ms   0.00x   0.00x  yes
+  chain(128), k = n+2           1442      9419     45.24ms   6125.87ms   3536.49ms   0.01x   0.01x  yes
+  chain(512), k = n+2           5666     37067   1600.19ms  25703.68ms  15051.67ms   0.06x   0.11x  yes
+  fanin(8), k = 3                162       905      0.27ms    207.80ms    130.64ms   0.00x   0.00x  yes
+  fanin(32), k = 3               570      3173      0.82ms    210.59ms    139.37ms   0.00x   0.01x  yes
+  fanin(128), k = 3             2202     12245      3.16ms    228.49ms    147.59ms   0.01x   0.02x  yes
+  fanin(512), k = 3             8730     48533     13.10ms    262.14ms    180.99ms   0.05x   0.07x  yes
+  branching(6), k = d+2          142      6587      2.85ms    443.50ms    273.24ms   0.01x   0.01x  yes
+  branching(8), k = d+2          178     25131     12.08ms    594.69ms    370.17ms   0.02x   0.03x  yes
+  branching(10), k = d+2         214     98971     56.53ms    870.18ms    574.64ms   0.06x   0.10x  yes
+  branching(12), k = d+2         250    393995    300.53ms   1632.17ms   1231.02ms   0.18x   0.24x  yes
+  alias(64)                      385      2991      1.05ms    684.88ms    455.27ms   0.00x   0.00x  yes
+  alias(256)                    1537     36495     15.41ms   2625.42ms   1723.13ms   0.01x   0.01x  yes
+  alias(512)                    3073    138511     65.23ms   5202.59ms   3453.84ms   0.01x   0.02x  yes
+  fields(16)                      38       584      1.19ms    565.23ms    376.31ms   0.00x   0.00x  yes
+  fields(32)                      70      1904      8.68ms   1066.26ms    650.80ms   0.01x   0.01x  yes
+  fields(64)                     134      6848     88.75ms   2159.44ms   1417.52ms   0.04x   0.06x  yes
+  fields_chain(32)               367      1762      2.20ms   3013.24ms   1942.77ms   0.00x   0.00x  yes
+  fields_chain(128)             1423      6850     20.57ms  11776.79ms   7529.91ms   0.00x   0.00x  yes
+  fields_chain(256)             2831     13634     75.58ms  20798.00ms  12896.18ms   0.00x   0.01x  yes
 ```
 
-Both parallel backends are **10× to 1000× slower than sequential**, on every
-single case. On Figure 1 itself: 0.56 ms sequential against 238 ms parallel.
+Both parallel backends are **5× to 1400× slower than sequential**, on every
+single case. On Figure 1 itself: 0.47 ms sequential against 298 ms parallel.
 
 The obvious question is how much of that is the concurrent data structures
 (`DashMap`-backed indices, `boxcar` relations) and how much is threads getting
@@ -283,46 +345,46 @@ in each other's way. `RAYON_NUM_THREADS=1` separates them — same parallel
 programs, same concurrent data structures, but no actual parallelism:
 
 ```
-  case                           |P|    tuples         seq         par      par+ir    par×     ir×
-  figure1, k = 4                  82       520      0.21ms      5.22ms      3.95ms   0.04x   0.05x
-  chain(32), k = n+2             386      2507      2.45ms     30.12ms     22.57ms   0.08x   0.11x
-  chain(128), k = n+2           1442      9419     40.90ms    170.61ms    138.28ms   0.24x   0.30x
-  chain(512), k = n+2           5666     37067   1466.08ms   2805.25ms   2651.40ms   0.52x   0.55x
-  fanin(128), k = 3             2202     16597      4.94ms     10.73ms      9.50ms   0.46x   0.52x
-  fanin(512), k = 3             8730     65941     21.41ms     32.34ms     31.08ms   0.66x   0.69x
-  branching(8), k = d+2          178     25131     13.05ms     27.61ms     24.84ms   0.47x   0.53x
-  branching(10), k = d+2         214     98971     63.56ms     99.94ms     96.15ms   0.64x   0.66x
-  branching(12), k = d+2         250    393995    324.99ms    430.26ms    427.44ms   0.76x   0.76x
-  alias(512)                    3073    138511     60.73ms    172.48ms    153.59ms   0.35x   0.40x
-  fields(64)                     134      6848     88.89ms    178.23ms    168.83ms   0.50x   0.53x
-  fields_chain(256)             2831     13634     75.68ms    502.03ms    420.27ms   0.15x   0.18x
+  case                           |P|    tuples         seq         par      par+ir    par×     ir×  agree
+  figure1, k = 4                  82       452      0.54ms      5.46ms      4.26ms   0.10x   0.13x  yes
+  chain(32), k = n+2             386      2507      2.64ms     31.80ms     23.85ms   0.08x   0.11x  yes
+  chain(128), k = n+2           1442      9419     45.21ms    179.27ms    145.89ms   0.25x   0.31x  yes
+  chain(512), k = n+2           5666     37067   1604.12ms   2976.08ms   2815.66ms   0.54x   0.57x  yes
+  fanin(128), k = 3             2202     12245      3.14ms      8.33ms      7.31ms   0.38x   0.43x  yes
+  fanin(512), k = 3             8730     48533     13.05ms     21.78ms     20.67ms   0.60x   0.63x  yes
+  branching(8), k = d+2          178     25131     12.09ms     27.66ms     24.46ms   0.44x   0.49x  yes
+  branching(10), k = d+2         214     98971     55.89ms     90.15ms     86.26ms   0.62x   0.65x  yes
+  branching(12), k = d+2         250    393995    295.70ms    391.41ms    385.20ms   0.76x   0.77x  yes
+  alias(512)                    3073    138511     62.17ms    174.07ms    156.05ms   0.36x   0.40x  yes
+  fields(64)                     134      6848     88.69ms    178.15ms    168.32ms   0.50x   0.53x  yes
+  fields_chain(256)             2831     13634     79.30ms    542.64ms    451.35ms   0.15x   0.18x  yes
 ```
 
 This is the interesting result. **Going from 1 rayon thread to 20 makes the
-parallel backend 4× to 45× slower**, not faster:
+parallel backend 4× to 55× slower**, not faster:
 
 | case | par @ 1 thread | par @ 20 threads | penalty |
 |---|---|---|---|
-| `figure1` | 5.2 ms | 237.6 ms | 45× |
-| `chain(32)` | 30.1 ms | 1248.9 ms | 41× |
-| `fields_chain(256)` | 502.0 ms | 22890.2 ms | 46× |
-| `chain(512)` | 2805.3 ms | 25518.2 ms | 9.1× |
-| `branching(12)` | 430.3 ms | 1890.5 ms | 4.4× |
+| `figure1` | 5.5 ms | 298.1 ms | 54.6× |
+| `chain(32)` | 31.8 ms | 1599.7 ms | 50.3× |
+| `fields_chain(256)` | 542.6 ms | 20798.0 ms | 38.3× |
+| `chain(512)` | 2976.1 ms | 25703.7 ms | 8.6× |
+| `branching(12)` | 391.4 ms | 1632.2 ms | 4.2× |
 
 So the diagnosis is not "concurrent data structures are expensive" — at one
-thread the overhead is a modest 1.3×–25×, and it *amortizes away* as the work
-grows: `branching(12)` reaches 0.76× of sequential, `fanin(512)` 0.66×, and
+thread the overhead is a modest 1.3×–24×, and it *amortizes away* as the work
+grows: `branching(12)` reaches 0.76× of sequential, `fanin(512)` 0.60×, and
 the trend across each family is monotone toward break-even. The diagnosis is
 **contention and dispatch across threads on deltas that are far too small**.
 This program has roughly 90 rules; each round hands most of them a delta of a
 handful of tuples, and paying rayon's fork/join plus cross-shard `DashMap`
-traffic on those is pure loss. The penalty shrinks (45× → 4.4×) exactly as the
+traffic on those is pure loss. The penalty shrinks (55× → 4.2×) exactly as the
 per-round work grows, which is the same story from the other direction.
 
 Two further readings:
 
 **Inter-rule parallelism is the better of the two axes.** `par+ir` beats plain
-`par` on every case at both thread counts, by 1.3–1.6× at 20 threads. That is
+`par` on every case at both thread counts, by 1.3–1.7× at 20 threads. That is
 the axis this program's shape actually offers: stratum B is one very large
 SCC, so there are many mutually independent rules available to run at once,
 whereas most individual rules have nothing to spread across 20 threads.
@@ -347,12 +409,12 @@ configuration to use if one of them must be run.
 
 The sequential column also makes visible what the relation sizes hide.
 `fields(n)` goes 584 → 1,904 → 6,848 tuples (the `Θ(n²)` from suffix
-congruence) while sequential time goes 1.2 ms → 8.7 ms → 92 ms. Tuples grow
-~3.3× per step; time grows 7× then 11×. The extra factor is access-path
+congruence) while sequential time goes 1.2 ms → 8.7 ms → 89 ms. Tuples grow
+~3.3× per step; time grows 7× then 10×. The extra factor is access-path
 length: paths here reach depth `n`, and every hash and comparison on an
 `AccessPath` is `O(depth)`. Cost per tuple makes it plainest —
-`fields_chain(256)` spends 5.5 µs per tuple (13,634 tuples, 75 ms) against
-`alias(512)`'s 0.46 µs (138,511 tuples, 64 ms), a 12× difference for the same
+`fields_chain(256)` spends 5.5 µs per tuple (13,634 tuples, 76 ms) against
+`alias(512)`'s 0.47 µs (138,511 tuples, 65 ms), a 12× difference for the same
 evaluator on the same machine.
 
 So the honest summary of the access-path domain is: quadratic in tuples,
@@ -378,6 +440,14 @@ them. Each test names the property it defends:
 - `recursion_through_a_field_load_terminates` — bounded `edge`, depth ≤ 1.
 - `parallel_backends_derive_the_same_relations` — all three backends agree on
   five programs.
+- `a_receiver_with_no_values_stays_put_and_dispatches_nothing` — the vacuous
+  corner of adequacy: an empty deciding operand does not propagate, admits no
+  call edge, and is not ⊤-summarized.
+- `every_renamed_placeholder_is_pending_in_the_procedure_it_lands_in` — the
+  structural invariant behind the `blocked` guard: if a callsite renames a
+  placeholder into `q`, then `q` holds it as pending. Guarding `pending`
+  without guarding `root_map` breaks this and leaves `q` holding an obligation
+  with no owner.
 
 The two examples are the full picture and are meant to be re-run by hand after
 any rule change; the tests are the part that fails automatically.

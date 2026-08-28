@@ -58,20 +58,25 @@ fn fit(rel: &str, points: &[(Program, usize)]) -> f64 {
 
 /// The reference point for everything else. If these move, the analysis
 /// derives a different amount of work on the paper's own example.
+///
+/// `resolve = 2` is worth reading twice: it is exactly the two call edges the
+/// paper reports (`bar1 → Y.poly`, `bar2 → Z.poly`), one tuple each. Before
+/// propagation was guarded on `blocked`, each adequate instance also spawned a
+/// child in `service` that re-derived the same decision, and this pinned 4.
 #[test]
 fn figure1_relation_sizes_are_stable() {
     let m = run_sizes(&figure1::program(), 4);
     for (rel, want) in [
-        ("edge", 47),
-        ("points", 63),
-        ("path_used", 71),
-        ("pending", 6),
-        ("pub_edge", 17),
-        ("pub_points", 11),
-        ("resolve", 4),
-        ("settled", 4),
-        ("root_map", 36),
-        ("crit_map", 12),
+        ("edge", 40),
+        ("points", 53),
+        ("path_used", 65),
+        ("pending", 4),
+        ("pub_edge", 16),
+        ("pub_points", 5),
+        ("resolve", 2),
+        ("settled", 2),
+        ("root_map", 30),
+        ("crit_map", 6),
     ] {
         assert_eq!(m[rel], want, "figure1 k=4: {rel} changed");
     }

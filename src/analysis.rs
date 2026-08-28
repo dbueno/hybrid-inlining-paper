@@ -53,11 +53,22 @@
 //! made literal. Publishing a summary eliminates locals but keeps those
 //! placeholders, and that is what makes the summary *hybrid*.
 //!
-//! Because nothing ever *retracts* a placeholder, a resolved placeholder stays
-//! published, and a caller keeps spawning child instances of it. That
-//! duplication is confluent and harmless (Theorem 3.3), bounded by the same
-//! k-limit as everything else, and hidden from reporting by
-//! [`HybridAnalysis::settled`]; it is the price of monotonicity.
+//! Nothing ever *retracts* a placeholder, so a resolved placeholder stays
+//! published. What a caller does with it is a separate question, and the
+//! answer is a *positive* test rather than a retraction: an instance crosses a
+//! callsite only while [`HybridAnalysis::blocked`] holds of it — while the
+//! caller still controls the operand that decides it. Adequacy is the
+//! complement, and an adequate instance has already been decided here, so
+//! spawning a child of it in every caller would duplicate a completed
+//! decision. Propagation and the placeholder renaming in
+//! [`HybridAnalysis::root_map`] carry the same guard, so `p` and its callers
+//! agree on which instances cross the callsite.
+//!
+//! That the guard is monotone is what makes it legal inside the SCC:
+//! `blocked` only ever grows, so "propagate iff blocked" is order-independent
+//! and the fixpoint is unchanged. The duplication it removes was confluent
+//! and harmless (Theorem 3.3) — it was simply never necessary, and calling it
+//! the price of monotonicity was giving up too early.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -245,12 +256,17 @@ ascent_source! { hybrid_rules:
         crit_origin(p, s, id), store_index_var(s, _, _, from);
 
     // Propagation (§3.2): a placeholder moves into the caller, where more
-    // context has accumulated. Unconditional — resolving an instance here no
-    // longer suppresses its child there, because "resolved" is not a state
-    // this program has. The k-limit bounds the call string so recursion
-    // terminates.
+    // context has accumulated — but only while it is still `blocked`, i.e.
+    // while the caller controls what decides it. An adequate instance has a
+    // complete points-to set for its deciding operand (nothing outside `p` can
+    // add to it, because any caller-reachable component would appear as a
+    // symbolic path and block), so it is decided here and its callees are
+    // exactly the ones a propagated copy would find. `blocked` is a presence
+    // test and only grows, so the guard is monotone and lives in the SCC. The
+    // k-limit bounds the call string so recursion terminates.
     pending(q.clone(), id.push(s)) <--
         pending(p, id),
+        blocked(p, id),
         eff_direct(s, p), in_proc(s, q, _),
         k_limit(k), if id.depth() < *k;
 
@@ -354,12 +370,15 @@ ascent_source! { hybrid_rules:
         eff_direct(s, p), actual_arg(s, i, a);
     root_map(s.clone(), Base::Ret(p.clone()), Base::Var(r.clone())) <--
         eff_direct(s, p), bind_ret(s, r);
-    // A placeholder is renamed rather than resolved — this *is* propagation.
+    // A placeholder is renamed rather than resolved — this *is* propagation, so
+    // it carries the same `blocked` guard as the `pending` rule above. Without
+    // that, an adequate instance would leave `q` holding placeholder-rooted
+    // nodes for an obligation `q` never lists as pending.
     root_map(s.clone(), Base::CritSlot(id.clone(), *i), Base::CritSlot(id.push(s), *i)) <--
-        eff_direct(s, p), pending(p, id), crit_operand(id, i),
+        eff_direct(s, p), pending(p, id), blocked(p, id), crit_operand(id, i),
         k_limit(k), if id.depth() < *k;
     root_map(s.clone(), Base::CritRet(id.clone()), Base::CritRet(id.push(s))) <--
-        eff_direct(s, p), pending(p, id),
+        eff_direct(s, p), pending(p, id), blocked(p, id),
         k_limit(k), if id.depth() < *k;
 
     edge(q.clone(), a.rebase(ta.clone()), b.rebase(tb.clone())) <--

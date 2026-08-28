@@ -20,6 +20,7 @@
 //! | [`fields`] | access-path suffix congruence inside one procedure |
 //! | [`fields_chain`] | access-path *length* growing through inlining |
 //! | [`recursive_field`] | termination when inlining feeds its own summary |
+//! | [`dead_receiver`] | the vacuous corner of adequacy: an empty deciding operand |
 
 use std::collections::BTreeMap;
 
@@ -309,6 +310,30 @@ pub fn fields_chain(n: usize) -> Program {
     b.proc_("Entry", &["this@Entry"]);
     b.alloc("E0", "Entry", "o", "lo", "Obj");
     b.call("E1", "Entry", &format!("P{n}"), &["this@Entry", "o"], Some("res"));
+    b.entry("Entry");
+    b.done()
+}
+
+/// A critical statement whose deciding operand has *no* reaching definition:
+/// `x@V` is never assigned, so `pt(x@V)` is empty and the receiver of
+/// `x.poly(obj)` is decided by nothing at all.
+///
+/// This is the vacuous corner of adequacy. `blocked` is a presence test, so an
+/// empty points-to set makes the instance *un*blocked — not because the
+/// context pinned it, but because there is nothing to pin. `V` has a caller,
+/// so the instance could propagate; the point of the family is that
+/// propagating it would only manufacture equally vacuous copies.
+pub fn dead_receiver() -> Program {
+    let mut b = B::default();
+    b.hierarchy(2);
+    b.proc_("V", &["this@V", "obj@V"]);
+    // `x@V` is a local of `V` that no statement ever writes.
+    b.vcall("S", "V", "x@V", "poly(Obj)", &["x@V", "obj@V"], "r@V");
+    b.ret("V", "r@V");
+
+    b.proc_("Entry", &["this@Entry"]);
+    b.alloc("E0", "Entry", "o", "lo", "Obj");
+    b.call("E1", "Entry", "V", &["this@Entry", "o"], Some("res"));
     b.entry("Entry");
     b.done()
 }

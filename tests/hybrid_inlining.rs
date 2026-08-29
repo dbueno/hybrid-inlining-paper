@@ -678,8 +678,8 @@ fn an_index_that_is_not_a_constant_is_undecidable() {
     let get = CritId::origin("L2").push(&Stmt::from("L9b"));
     let h = run_hybrid(&prog, 4);
 
-    // Adequacy is no longer a gate, so both classifications stay readable in
-    // the finished model rather than only in the round that discovered them.
+    // `adequate` is stratum C reporting, so both classifications stay
+    // readable in the finished model.
     assert!(
         h.adequate.contains(&(p("build"), get.clone())),
         "no free variable reaches the index, so the context is adequate"
@@ -827,15 +827,15 @@ fn every_edb_relation_is_copied_into_the_analysis() {
 /// ```
 ///
 /// Both instances are stuck at `main`, and B's receiver is fed by A's
-/// placeholder. The round-based analysis had to treat that placeholder as
-/// part of `free(𝔞)` — "unresolved" was a state, and A was unresolved in the
-/// round B was classified in — so B was blocked, then forced, and admitted
-/// *both* `poly` implementations.
+/// placeholder. The question is whether that placeholder counts as part of
+/// `free(𝔞)`: if it does, B is blocked, then ⊤-summarized, and admits *both*
+/// `poly` implementations.
 ///
-/// In one fixpoint there is no such state. A is stuck, so it will be decided
-/// here from values that are already in `main`; its placeholder is therefore
-/// not free. A pins `P.get`, `P.get`'s `new Y()` flows through the
-/// placeholder into B's receiver, and B dispatches on what actually arrives.
+/// It does not. A is stuck, so it will be decided here from values that are
+/// already in `main` — nothing outside can add to it — and `free_root`'s
+/// `can_propagate` guard keeps it out. A pins `P.get`, `P.get`'s `new Y()`
+/// flows through the placeholder into B's receiver, and B dispatches on what
+/// actually arrives.
 #[test]
 fn a_chained_critical_resolves_from_what_actually_flows() {
     let mut prog = Program::default();
@@ -1070,10 +1070,10 @@ fn a_feeder_that_outlives_the_k_limit_forces_top() {
 /// T<i>.step() { A<i>: return new T<i+1>(); }        // plus a decoy D.step
 /// ```
 ///
-/// Every `S<i>` can only be decided once `S<i-1>` has been, so the
-/// round-based driver needed `n + 1` complete re-derivations of the whole
-/// IDB. Resolution is now ordinary positive recursion, so one semi-naive
-/// fixpoint discovers the entire cascade.
+/// Every `S<i>` can only be decided once `S<i-1>` has been — a chain of
+/// `n` dependent resolutions. Resolution is ordinary positive recursion, so
+/// the semi-naive fixpoint carries that chain itself and one run discovers
+/// the entire cascade.
 fn cascade_program(n: usize) -> Program {
     let mut prog = Program::default();
     let step = Sig::from("step()");

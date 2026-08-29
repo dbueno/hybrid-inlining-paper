@@ -2,7 +2,7 @@
 //!
 //! The analysis is a *single* Ascent program, [`HybridAnalysis`], evaluated to
 //! one fixpoint. [`run_hybrid`] builds it, calls `run()`, and hands it back;
-//! there is no driver and no round loop.
+//! there is no driver around it.
 //!
 //! # Why one fixpoint, and where the negations are
 //!
@@ -13,13 +13,34 @@
 //! **precision** device. What actually gets dispatched is per-allocation:
 //! each `Alloc(l) ∈ pt(recv)` independently justifies the one callee
 //! `lookup(type(l), sig)`. Firing that rule the moment each allocation
-//! appears, at every holder, is monotone (it triggers on the *presence* of a
-//! tuple), sound (a may-points-to member genuinely may be the receiver), and
-//! no less precise (allocations only accumulate along a propagation chain,
-//! and past the first adequate holder the set is frozen — Theorem 3.3's
-//! early-vs-late confluence). So the whole cycle
+//! appears is monotone (it triggers on the *presence* of a tuple), sound (a
+//! may-points-to member genuinely may be the receiver), and no less precise
+//! (allocations only accumulate along a propagation chain, and past the first
+//! adequate holder the set is frozen — Theorem 3.3's early-vs-late
+//! confluence). So the whole cycle
 //! `resolve → inline → edge → points → resolve` is ordinary positive
 //! recursion in one strongly connected component.
+//!
+//! Firing it at *every* holder, though, is confluent but wasteful, and the
+//! paper does not: `ready` dispatches only `S|Φ` and leaves `S|¬Φ` untouched.
+//! At a holder the instance is about to leave, whatever it resolves to is
+//! re-derived in the caller, which reads the same allocations back out of the
+//! published `CritSlot`. That duplicate costs a constant per level when the
+//! callee is ordinary — and stops being a constant when the callee is itself
+//! critical, because the nested placeholders it spawns carry distinct call
+//! strings and so do not merge.
+//!
+//! Suppressing it means knowing the instance *will* propagate, and the exact
+//! test for that is `blocked`, which lives in the SCC and cannot be negated
+//! there. An **under**-approximation of it, though, is available from the
+//! syntax alone: if the deciding operand is fed from a formal by a chain of
+//! moves, then `pt` of that slot provably contains a path rooted at that
+//! formal, so the instance is blocked. That is
+//! [`HybridAnalysis::will_propagate`], settled entirely below the fixpoint,
+//! and `!will_propagate` is therefore an ordinary stratified negation.
+//! Under-approximating is the direction that costs nothing: every instance
+//! that is genuinely adequate still resolves where it stands, and what the
+//! guard removes is only work the caller was going to repeat.
 //!
 //! What is left of the negations, from the lowest stratum up — the macro
 //! checks this stratification at compile time:
@@ -28,19 +49,25 @@
 //! |---------|-----------|----------|
 //! | A | [`HybridAnalysis::sig_size`], [`HybridAnalysis::critical`], [`HybridAnalysis::eff_direct`], [`HybridAnalysis::is_called`] | `count` over the EDB (N1) |
 //! | A′ | [`HybridAnalysis::uncalled`] | `!is_called`, over stratum A only |
-//! | B | **the SCC**: [`HybridAnalysis::edge`], [`HybridAnalysis::points`], [`HybridAnalysis::pending`], [`HybridAnalysis::pub_edge`], [`HybridAnalysis::blocked`], [`HybridAnalysis::top`], [`HybridAnalysis::resolve`], [`HybridAnalysis::index_acc`] | none — all positive |
+//! | A″ | [`HybridAnalysis::carries`], [`HybridAnalysis::decisive_var`], [`HybridAnalysis::slot_from_formal`], [`HybridAnalysis::will_propagate`] | none — positive over A |
+//! | B | **the SCC**: [`HybridAnalysis::edge`], [`HybridAnalysis::points`], [`HybridAnalysis::pending`], [`HybridAnalysis::pub_edge`], [`HybridAnalysis::blocked`], [`HybridAnalysis::top`], [`HybridAnalysis::resolve`], [`HybridAnalysis::index_acc`] | `!will_propagate`, over stratum A″ only |
 //! | C | [`HybridAnalysis::adequate`], [`HybridAnalysis::settled`] | `!blocked`, over the finished fixpoint |
 //!
 //! Stratum C is reporting only: it feeds nothing back, so negating over B is
-//! legal there. Adequacy has been demoted from *control* to *classification*.
+//! legal there. Adequacy *in its exact form* is classification, not control.
+//! What drives the analysis is the two things that stand in for it:
+//! `blocked`, its exact complement, used **positively** to gate propagation;
+//! and `will_propagate`, a syntactic under-approximation of that complement,
+//! used **negatively** to gate resolution. Between them they recover the
+//! paper's `ready` split without ever negating over `points`.
 //!
 //! The one place a genuine ⊤-fallback is still needed is a placeholder that
 //! can neither be pinned nor propagated — at an entry, at a procedure with no
 //! callers, or at the k-limit. That is [`HybridAnalysis::stuck`], whose only
 //! negation (`uncalled`) is over stratum A, and it is combined with a
 //! *presence* test — [`HybridAnalysis::blocked`], "the decisive slot sees a
-//! path rooted in `free(𝔞)`" — rather than the absence test `!adequate` the
-//! round-based version used.
+//! path rooted in `free(𝔞)`" — so no absence test over `points` is needed to
+//! reach it.
 //!
 //! # The constraint graph
 //!
@@ -69,6 +96,13 @@
 //! and the fixpoint is unchanged. The duplication it removes was confluent
 //! and harmless (Theorem 3.3) — it was simply never necessary, and calling it
 //! the price of monotonicity was giving up too early.
+//!
+//! Resolution carries the mirror image of that guard: an instance is
+//! dispatched here unless [`HybridAnalysis::will_propagate`] says the caller
+//! is certain to redo it. That relation is fixed before the fixpoint starts,
+//! so "resolve unless it will propagate" is order-independent for the same
+//! reason. The duplication *it* removes was equally confluent — and, when the
+//! callee is itself critical, the one duplication that was not also cheap.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -279,6 +313,49 @@ ascent_source! { hybrid_rules:
         pending(p, id), eff_direct(s, p), in_proc(s, _, _),
         k_limit(k), if id.depth() < *k;
 
+    // -- a *syntactic* under-approximation of "blocked, and will propagate" --
+    //
+    // `blocked` is the exact test, and it lives in the SCC, so it cannot be
+    // negated there. But an *under*-approximation of it is available from the
+    // syntax alone, in stratum A: if the deciding operand is fed from a formal
+    // by a chain of moves, then `pt` of that slot provably contains a
+    // symbolic path rooted at that formal, so the instance is blocked.
+
+    /// `carries(p, v, i)`: local `v` of `p` definitely holds `par_i@p`'s
+    /// value. Moves only — the point is to be *sound in the negative
+    /// direction*, so nothing that might not carry the value is admitted.
+    relation carries(Proc, Var, ArgIdx);
+    carries(p.clone(), v.clone(), *i) <-- formal(p, i, v);
+    carries(p.clone(), to.clone(), *i) <--
+        mov(s, to, from), in_proc(s, p, _), carries(p, from, i);
+
+    /// The deciding operand of a critical statement, syntactically.
+    relation decisive_var(Stmt, Var);
+    decisive_var(s.clone(), r.clone()) <-- virtual_call(s, r, _);
+    decisive_var(s.clone(), i.clone()) <-- load_index_var(s, _, _, i);
+    decisive_var(s.clone(), i.clone()) <-- store_index_var(s, _, i, _);
+
+    /// `slot_from_formal(p, id, i)`: the deciding slot of instance `id` at
+    /// `p` is fed from `par_i@p`. At the origin that is a move chain; across
+    /// a callsite it follows the actual argument the callee's formal is
+    /// bound to.
+    relation slot_from_formal(Proc, CritId, ArgIdx);
+    slot_from_formal(p.clone(), id.clone(), *i) <--
+        crit_origin(p, s, id), decisive_var(s, v), carries(p, v, i);
+    slot_from_formal(q.clone(), id.push(s), *j) <--
+        slot_from_formal(p, id, i), eff_direct(s, p), in_proc(s, q, _),
+        actual_arg(s, i, a), carries(q, a, j),
+        k_limit(k), if id.depth() < *k;
+
+    /// `will_propagate(p, id)`: this instance is definitely blocked here and
+    /// definitely has somewhere to go. Whatever it would resolve to here, the
+    /// caller re-derives from the published slot contents, so resolving it
+    /// here is redundant.
+    relation will_propagate(Proc, CritId);
+    will_propagate(p.clone(), id.clone()) <--
+        slot_from_formal(p, id, _), eff_direct(s, p), in_proc(s, _, _),
+        k_limit(k), if id.depth() < *k;
+
     /// `stuck(p, id)`: nowhere left to propagate to. Its complement of
     /// `can_propagate`, decomposed so that the only negation involved
     /// (`uncalled`) is over stratum A rather than over the `points` fixpoint:
@@ -396,8 +473,8 @@ ascent_source! { hybrid_rules:
     /// outside still controls may reach the operand that decides this
     /// statement.
     ///
-    /// This is a *presence* test, so unlike the round-based version it lives
-    /// in the SCC and can drive [`HybridAnalysis::top`] directly.
+    /// This is a *presence* test, so it lives in the SCC and can drive
+    /// [`HybridAnalysis::top`] directly.
     relation blocked(Proc, CritId);
     blocked(p.clone(), id.clone()) <--
         pending(p, id), decisive_slot(id, i),
@@ -409,7 +486,7 @@ ascent_source! { hybrid_rules:
     /// blocked — the context never pins it — and there is nowhere left to
     /// propagate to, so deferring would silently drop constraints.
     ///
-    /// This replaces the round-based `forced`, and with it the `!adequate`
+    /// Both operands are presence tests, so deciding it needs no `!adequate`
     /// negation over the `points` fixpoint.
     relation top(Proc, CritId);
     top(p.clone(), id.clone()) <-- blocked(p, id), stuck(p, id);
@@ -422,7 +499,7 @@ ascent_source! { hybrid_rules:
     /// set to be provably complete. The second is the ⊤ fallback.
     relation resolve(Proc, CritId, Proc);
     resolve(p.clone(), id.clone(), callee.clone()) <--
-        pending(p, id), call_crit(id),
+        pending(p, id), !will_propagate(p, id), call_crit(id),
         let recv = AccessPath::crit_slot(id.clone(), 0),
         points(p, recv, ?PtVal::Alloc(l)),
         alloc_type(l, t), crit_sig(id, sig), lookup(t, sig, callee);
@@ -435,7 +512,7 @@ ascent_source! { hybrid_rules:
     /// caller's business, and the instance simply propagates.
     relation index_undecidable(Proc, CritId);
     index_undecidable(p.clone(), id.clone()) <--
-        pending(p, id), index_crit(id),
+        pending(p, id), !will_propagate(p, id), index_crit(id),
         let index = AccessPath::crit_slot(id.clone(), 1),
         points(p, index, ?PtVal::Alloc(_));
 
@@ -445,7 +522,7 @@ ascent_source! { hybrid_rules:
     /// to nothing at all: dead code, and more precise than defaulting to π.
     relation index_acc(Proc, CritId, Accessor);
     index_acc(p.clone(), id.clone(), Accessor::Index(c.clone())) <--
-        pending(p, id), index_crit(id),
+        pending(p, id), !will_propagate(p, id), index_crit(id),
         let index = AccessPath::crit_slot(id.clone(), 1),
         points(p, index, ?PtVal::Const(c));
     index_acc(p.clone(), id.clone(), Accessor::IndexUnknown) <-- index_undecidable(p, id);
@@ -753,17 +830,17 @@ pub fn render_summary(summary: &Summary, placeholders: &BTreeSet<CritId>) -> Vec
 /// The same rules under Ascent's *parallel* backend.
 ///
 /// The whole domain is `Arc`-backed and so `Send + Sync`, and a single
-/// fixpoint has no driver serializing it between rounds, so `ascent_par!` is a
+/// fixpoint has no driver serializing it, so `ascent_par!` is a
 /// drop-in swap. Every program here includes the one [`hybrid_rules`] source,
 /// so none of them can drift from the sequential [`HybridAnalysis`]: a build
 /// fails if the rules ever stop being parallelizable.
 ///
 /// Two flavours, because Ascent parallelizes along two independent axes:
 ///
-/// - [`ParallelHybridAnalysis`] — *intra*-rule only, the `ascent_par!`
+/// - [`parallel::ParallelHybridAnalysis`] — *intra*-rule only, the `ascent_par!`
 ///   default: each rule's body is evaluated with a parallel iterator over the
 ///   driving relation's delta, one rule at a time.
-/// - [`inter_rule::InterRuleHybridAnalysis`] — `#![inter_rule_parallelism]` on
+/// - [`parallel::inter_rule::InterRuleHybridAnalysis`] — `#![inter_rule_parallelism]` on
 ///   top of that, so independent rules *within one SCC* also run
 ///   concurrently. This analysis has one very large SCC (stratum B), which is
 ///   exactly the shape that axis is meant for.

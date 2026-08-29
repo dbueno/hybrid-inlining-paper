@@ -198,8 +198,9 @@ ascent! {
     /// The program under analysis, as a set of EDB relations: the [`edb`]
     /// schema and no rules. Populate the public fields directly.
     ///
-    /// The analysis is a *separate* Ascent program ([`crate::analysis::Round`])
-    /// that includes the same schema, so the two cannot drift apart.
+    /// The analysis is a *separate* Ascent program
+    /// ([`crate::analysis::HybridAnalysis`]) that includes the same schema, so
+    /// the two cannot drift apart.
     pub struct Program;
 
     include_source!(crate::ir::edb);

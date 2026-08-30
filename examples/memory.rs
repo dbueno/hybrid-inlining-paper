@@ -197,6 +197,22 @@ fn exponent(xs: &[f64], ys: &[f64]) -> f64 {
     if den == 0.0 { 0.0 } else { num / den }
 }
 
+/// The parameter a family is swept over, read off its label: `m` for
+/// `fanin(m), k = 3`, `w` for `wide(64, w)` — the first argument that is not a
+/// fixed number. The sweep row is labelled with it so the table reads against
+/// the heading instead of calling every parameter `n`.
+fn param(label: &str) -> &str {
+    label
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .and_then(|(args, _)| {
+            args.split(',')
+                .map(str::trim)
+                .find(|a| a.parse::<usize>().is_err())
+        })
+        .unwrap_or("n")
+}
+
 struct Row {
     n: usize,
     edb: usize,
@@ -225,7 +241,7 @@ fn sweep(label: &str, note: &str, ns: &[usize], build: impl Fn(usize) -> (Progra
             rows.iter().map(|r| cell(f(r))).collect::<Vec<_>>().join("")
         );
     };
-    line("n", &|r| r.n.to_string());
+    line(param(label), &|r| r.n.to_string());
     line("|P|", &|r| r.edb.to_string());
     line("tuples", &|r| r.tuples.to_string());
     line("retained", &|r| human(r.usage.retained));

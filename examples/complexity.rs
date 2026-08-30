@@ -60,6 +60,22 @@ pub fn exponent(xs: &[f64], ys: &[f64]) -> Option<f64> {
     if den == 0.0 { None } else { Some(num / den) }
 }
 
+/// The parameter a family is swept over, read off its label: `m` for
+/// `fanin(m), k = 3`, `w` for `wide(64, w)` — the first argument that is not a
+/// fixed number. The sweep row is labelled with it so the table reads against
+/// the heading instead of calling every parameter `n`.
+fn param(label: &str) -> &str {
+    label
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .and_then(|(args, _)| {
+            args.split(',')
+                .map(str::trim)
+                .find(|a| a.parse::<usize>().is_err())
+        })
+        .unwrap_or("n")
+}
+
 struct Family {
     label: &'static str,
     note: &'static str,
@@ -88,7 +104,8 @@ fn report(f: &Family) {
     println!("\n\n### {} — {}", f.label, f.note);
     let ns: Vec<f64> = f.runs.iter().map(|(_, sz, _)| *sz as f64).collect();
     println!(
-        "  parameter n:      {}",
+        "  {:<18}{}",
+        format!("parameter {}:", param(f.label)),
         f.runs.iter().map(|(n, ..)| n.to_string()).collect::<Vec<_>>().join("  ")
     );
     println!(

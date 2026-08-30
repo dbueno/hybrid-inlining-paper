@@ -26,155 +26,19 @@
 //! `cargo bench --bench memory` measures the same quantity under criterion,
 //! where `--save-baseline`/`--baseline` does the comparing for you.
 
-use hybrid_inlining_paper::analysis::HybridAnalysis;
 use hybrid_inlining_paper::families::*;
 use hybrid_inlining_paper::figure1;
 use hybrid_inlining_paper::ir::Program;
-use hybrid_inlining_paper::mem::{Counting, Payload, Usage, human, measure, reserved_bytes};
+use hybrid_inlining_paper::mem::{Counting, Usage, human, idb_tuples, report, run_measured};
 
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
-/// The IDB relations, named once. Everything the report does per relation —
-/// counting tuples, sizing the `Vec`, walking the `Arc`s behind the tuples —
-/// goes through this list, so none of them can fall behind the schema
-/// separately.
-macro_rules! idb {
-    ($h:expr, $each:ident) => {
-        $each![
-            $h, sig_target, sig_size, mono_target, eff_direct, critical, known_proc,
-            is_called, uncalled, edge, points, path_used, crit_origin, pending,
-            can_propagate, carries, decisive_var, slot_from_formal, will_propagate, stuck,
-            crit_operand, call_crit, load_crit, store_crit, index_crit, decisive_slot,
-            crit_sig, free_root, pub_root, pub_edge, pub_points, root_map, blocked, top,
-            resolve, index_undecidable, index_acc, crit_map, adequate, settled,
-        ]
-    };
-}
-
-/// The EDB relations, likewise. Walked only to mark what the front end already
-/// allocated, never counted — see [`split`].
-macro_rules! edb {
-    ($h:expr, $each:ident) => {
-        $each![
-            $h, procedure, proc_type, proc_sig, entry, in_proc, alloc, alloc_type,
-            const_assign, mov, load_field, store_field, load_static, store_static,
-            load_index_const, store_index_const, load_index_var, store_index_var,
-            direct_call, virtual_call, actual_arg, bind_ret, formal, ret, direct_subtype,
-            lookup, k_limit,
-        ]
-    };
-}
-
-/// Every IDB relation, as `(name, tuples, bytes the `Vec` holds)`.
-///
-/// The byte figure is the `Vec` alone: no `Arc` suffix, no interned symbol, no
-/// index. [`split`] accounts for the rest.
-fn idb_relations(h: &HybridAnalysis) -> Vec<(&'static str, usize, usize)> {
-    macro_rules! sizes {
-        ($h:expr, $($name:ident),* $(,)?) => {
-            vec![$((stringify!($name), $h.$name.len(), reserved_bytes(&$h.$name))),*]
-        };
-    }
-    idb!(h, sizes)
-}
-
-/// Where [`Usage::retained`] went, in three parts.
-///
-/// `vecs` and `payload` are measured; `indices` is what is left, because
-/// Ascent's index fields are private and cannot be sized from outside. The
-/// EDB is walked first and discarded so that symbols the front end allocated
-/// — which a derived tuple only clones an `Arc` handle to — are not charged to
-/// the fixpoint.
-fn split(h: &HybridAnalysis, usage: &Usage) -> (usize, usize, usize) {
-    macro_rules! walk {
-        ($h:expr, $($name:ident),* $(,)?) => {{
-            let mut p = Payload::default();
-            $(p.walk_all(&$h.$name);)*
-            p
-        }};
-    }
-    let mut p = edb!(h, walk);
-    p.restart();
-    macro_rules! walk_into {
-        ($h:expr, $($name:ident),* $(,)?) => {{ $(p.walk_all(&$h.$name);)* }};
-    }
-    idb!(h, walk_into);
-    let payload = p.bytes();
-
-    let vecs: usize = idb_relations(h).iter().map(|(_, _, b)| b).sum();
-    let indices = usage.retained.saturating_sub(vecs + payload);
-    (vecs, payload, indices)
-}
-
-/// Run the fixpoint over `prog`, measuring only `run()`.
-///
-/// `for_program` — which copies the EDB in — happens outside the measured
-/// region, so what is reported is the derivation: the IDB tuples, their `Arc`
-/// payloads, and every index Ascent builds along the way (including the ones
-/// over the EDB, which it builds lazily once the fixpoint starts).
-fn run_measured(prog: &Program, k: usize) -> (HybridAnalysis, Usage) {
-    let mut h = HybridAnalysis::for_program(prog, k);
-    let ((), usage) = measure(|| h.run());
-    (h, usage)
-}
-
-/// Total IDB tuples — the denominator for `B/tuple`.
-fn idb_tuples(h: &HybridAnalysis) -> usize {
-    idb_relations(h).iter().map(|(_, n, _)| n).sum()
-}
-
 /// Per-relation table for one program, plus what the relations do not explain.
 fn breakdown(label: &str, prog: &Program, k: usize) {
     let (h, usage) = run_measured(prog, k);
-    let mut rels = idb_relations(&h);
-    rels.retain(|(_, n, _)| *n > 0);
-    rels.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(b.0)));
-
-    let tuples: usize = rels.iter().map(|(_, n, _)| n).sum();
-    let vec_bytes: usize = rels.iter().map(|(_, _, b)| b).sum();
-
     println!("\n## {label}");
-    println!(
-        "  |P| = {} EDB facts;  retained {}, peak {}, {} allocations",
-        edb_size(prog),
-        human(usage.retained),
-        human(usage.peak),
-        usage.allocs
-    );
-    println!("\n  {:<20} {:>8} {:>12} {:>8}", "relation", "tuples", "Vec bytes", "B/tuple");
-    for (name, n, bytes) in &rels {
-        println!(
-            "  {name:<20} {n:>8} {:>12} {:>8.1}",
-            human(*bytes),
-            *bytes as f64 / *n as f64
-        );
-    }
-    println!(
-        "  {:<20} {tuples:>8} {:>12} {:>8.1}",
-        "-- total",
-        human(vec_bytes),
-        vec_bytes as f64 / tuples as f64
-    );
-    // Where the rest of `retained` is. The `Vec`s above are the part
-    // `relation_sizes_summary()` can see; the other two lines are the part it
-    // cannot, and between them they are the majority of the memory. A rule
-    // edit that changes which columns a relation is joined on moves the index
-    // line and leaves every tuple count where it was.
-    let (vecs, payload, indices) = split(&h, &usage);
-    let pct = |n: usize| 100.0 * n as f64 / usage.retained.max(1) as f64;
-    println!("\n  where `retained` went");
-    println!("    tuple Vecs         {:>10}  {:>4.0}%", human(vecs), pct(vecs));
-    println!(
-        "    Arc payloads       {:>10}  {:>4.0}%   suffixes and call strings the fixpoint built",
-        human(payload),
-        pct(payload)
-    );
-    println!(
-        "    Ascent indices     {:>10}  {:>4.0}%   by subtraction: the index fields are private",
-        human(indices),
-        pct(indices)
-    );
+    report(&h, &usage, edb_size(prog));
 }
 
 /// Least-squares slope of `log y` against `log x`. Same fit as

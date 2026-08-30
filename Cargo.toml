@@ -9,6 +9,33 @@ autobenches = false
 [dependencies]
 ascent = "0.8.0"
 
+# The CTADL front end (`src/ctadl.rs`). Optional because `ctadl-ir` pulls in
+# arrow and parquet: the core crate builds in a couple of seconds without it.
+# Enable with `--features ctadl`.
+ctadl-ir = { path = "../ctadl-rs/ctadl-ir", features = ["serde"], optional = true }
+bitcode = { version = "0.6", features = ["serde"], optional = true }
+
+[features]
+ctadl = ["dep:ctadl-ir", "dep:bitcode"]
+# An instrumented copy of the analysis (`analysis::profile`). Off by default:
+# the per-rule timers must not be in the benchmark builds.
+profile = []
+
+[[example]]
+name = "ctadl_import"
+required-features = ["ctadl"]
+
+[[example]]
+name = "ctadl_profile"
+required-features = ["ctadl", "profile"]
+
+# The counting allocator is a global, so the memory report over an import is a
+# separate binary from `ctadl_profile`: rule timings must not be taken with an
+# atomic increment on every allocation.
+[[example]]
+name = "ctadl_memory"
+required-features = ["ctadl"]
+
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
 

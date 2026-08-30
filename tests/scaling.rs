@@ -14,7 +14,8 @@ use hybrid_inlining_paper::analysis::parallel::inter_rule::InterRuleHybridAnalys
 use hybrid_inlining_paper::analysis::run_hybrid;
 use hybrid_inlining_paper::families::*;
 use hybrid_inlining_paper::figure1;
-use hybrid_inlining_paper::ir::Program;
+use hybrid_inlining_paper::ir::{Field, Proc, Program, Stmt, Var};
+use hybrid_inlining_paper::path_bound::{self, Bound};
 
 fn sizes(summary: &str) -> BTreeMap<String, usize> {
     summary
@@ -182,20 +183,81 @@ fn many_procedures_cost_a_constant_each_when_nothing_is_critical() {
     );
 }
 
-/// Access-path *depth* has no limit of its own: inlining appends one accessor
-/// per call level. Tuple counts stay linear here, so only this test sees it.
+/// The deepest access path in `edge`.
+fn deepest(h: &hybrid_inlining_paper::analysis::HybridAnalysis) -> usize {
+    h.edge
+        .iter()
+        .flat_map(|(_, a, b)| [a.accessors.len(), b.accessors.len()])
+        .max()
+        .unwrap()
+}
+
+/// Access-path depth used to have no limit of its own: inlining appended one
+/// accessor per call level, and `fields_chain(n)` reached depth `n + 1` with
+/// nothing to stop it at any `n`. The `paths` bound is what stops it, and this
+/// is where that shows.
+///
+/// `P_i` is `t = P_{i-1}(x); return t.f_i` — one accessor, and no procedure
+/// spells two of them in a row — so the default vocabulary reaches depth 1,
+/// and so does the analysis. The precision that buys termination is exactly
+/// this: `ret@P_i ⊇ par_1@P_i.f0.f1…fi` is no longer derived.
 #[test]
-fn access_path_depth_grows_with_call_depth() {
+fn the_path_bound_holds_depth_where_the_syntax_puts_it() {
     for n in [2usize, 4, 8, 16] {
-        let h = run_hybrid(&fields_chain(n), 0);
-        let max = h
-            .edge
-            .iter()
-            .flat_map(|(_, a, b)| [a.accessors.len(), b.accessors.len()])
-            .max()
-            .unwrap();
-        assert_eq!(max, n + 1, "fields_chain({n}) deepest access path");
+        assert_eq!(deepest(&run_hybrid(&fields_chain(n), 0)), 1, "fields_chain({n})");
     }
+}
+
+/// The depth is the *vocabulary's*, not a constant baked into the rules.
+/// Folding admits concatenations no single procedure spells, and the analysis
+/// follows the set up as far as it goes — to `fields_chain`'s exact answer,
+/// `n + 1`, once the fold reaches it.
+///
+/// This is also the cost of asking: each fold level multiplies the vocabulary
+/// by its own size, so `|paths|` here goes 10, 91, 820, 7381.
+#[test]
+fn folding_the_bound_buys_back_the_depth_it_gave_up() {
+    for fold in [1usize, 2, 3] {
+        let mut prog = fields_chain(8);
+        path_bound::install(&mut prog, &Bound { fold, ..Bound::default() });
+        assert_eq!(deepest(&run_hybrid(&prog, 0)), fold, "fields_chain(8), fold {fold}");
+    }
+
+    // `fields_chain(2)`'s deepest path is 3, and a deep enough fold reaches
+    // it: the bound stops constraining before the analysis does.
+    let mut prog = fields_chain(2);
+    path_bound::install(&mut prog, &Bound { fold: 4, ..Bound::default() });
+    assert_eq!(deepest(&run_hybrid(&prog, 0)), 3);
+}
+
+/// The generator `backflash-profile.md` identifies, in its smallest form:
+/// `a = b` and `b = a.f` put a cycle in `edge` under a strict extension, so
+/// congruence derives `a.f ⊇ b.f`, then `b.f ⊇ a.f.f`, then `a.f.f ⊇ b.f.f`,
+/// forever. Two statements are enough, and no `k` and no call graph are
+/// involved.
+///
+/// The program names `.f` and nothing longer, so that is where it stops. The
+/// test terminating at all is half of what it asserts.
+#[test]
+fn a_cycle_under_a_field_load_no_longer_generates_paths_forever() {
+    let mut prog = Program::default();
+    prog.procedure = vec![(Proc::from("p"),)];
+    prog.formal = vec![(Proc::from("p"), 1, Var::from("b"))];
+    prog.ret = vec![(Proc::from("p"), Var::from("a"))];
+    prog.in_proc = vec![
+        (Stmt::from("S1"), Proc::from("p"), 0),
+        (Stmt::from("S2"), Proc::from("p"), 1),
+    ];
+    prog.mov = vec![(Stmt::from("S1"), Var::from("a"), Var::from("b"))];
+    prog.load_field = vec![(
+        Stmt::from("S2"),
+        Var::from("b"),
+        Var::from("a"),
+        Field::from("f"),
+    )];
+
+    assert_eq!(path_bound::for_program(&prog).len(), 2, "the vocabulary is ε and .f");
+    assert_eq!(deepest(&run_hybrid(&prog, 2)), 1);
 }
 
 /// Direct recursion through a field load reaches a fixpoint rather than

@@ -38,7 +38,7 @@ pub const EDB: &[&str] = &[
     "const_assign", "mov", "load_field", "store_field", "load_static", "store_static",
     "load_index_const", "store_index_const", "load_index_var", "store_index_var",
     "direct_call", "virtual_call", "actual_arg", "bind_ret", "formal", "ret",
-    "direct_subtype", "lookup", "k_limit",
+    "direct_subtype", "lookup", "paths", "k_limit",
 ];
 
 /// Least-squares slope of `log|R|` against `log|P|`.
@@ -163,6 +163,10 @@ fn main() {
         println!("  {k:<20} {n}");
     }
 
+    // What this measures is now the *bound*: `paths` fixes the vocabulary
+    // before the fixpoint starts, so these depths are the syntactic set's, not
+    // the closure's. `fields_chain` assembles its path across calls and so
+    // stops at 1; `fields` spells its chain out in one procedure and does not.
     println!("\n\n## access-path depth (tuple counts alone hide this)");
     println!("  {:>4}  {:>14} {:>16}  {:>14} {:>16}", "n",
              "chain max", "chain accessors", "fields max", "fields accessors");

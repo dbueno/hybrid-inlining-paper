@@ -200,6 +200,79 @@ impl fmt::Debug for Accessor {
     }
 }
 
+/// An access path's *suffix*: the accessor sequence, with no root.
+///
+/// This is what the bound on access paths (`Paths` in [`crate::ir::edb`])
+/// ranges over. A whole path cannot be enumerated ahead of the analysis — a
+/// [`Base::CritSlot`] carries a call string the fixpoint invents — but a
+/// suffix can, and the suffix is the only part of a path that ever grows:
+/// [`AccessPath::rebase`] moves a root and leaves the suffix alone, so every
+/// rule that lengthens a path lengthens this.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Suffix(pub Arc<[Accessor]>);
+
+impl Suffix {
+    /// The empty suffix, ε — the suffix of a bare root.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// The accessors, in order.
+    pub fn as_slice(&self) -> &[Accessor] {
+        &self.0
+    }
+
+    /// How many accessors: the *depth* of any path carrying this suffix.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// True for ε.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// `self` followed by `rest`.
+    pub fn extended(&self, rest: &[Accessor]) -> Self {
+        let mut accessors = self.0.to_vec();
+        accessors.extend_from_slice(rest);
+        Self(accessors.into())
+    }
+
+    /// `a` followed by `self`. The direction the syntactic bound builds in:
+    /// an outer accessor is discovered *after* the suffix beneath it.
+    pub fn prepended(&self, a: &Accessor) -> Self {
+        let mut accessors = Vec::with_capacity(self.0.len() + 1);
+        accessors.push(a.clone());
+        accessors.extend_from_slice(&self.0);
+        Self(accessors.into())
+    }
+}
+
+impl From<Vec<Accessor>> for Suffix {
+    fn from(v: Vec<Accessor>) -> Self {
+        Self(v.into())
+    }
+}
+
+impl fmt::Display for Suffix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.is_empty() {
+            return write!(f, "ε");
+        }
+        for a in self.0.iter() {
+            write!(f, "{a}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for Suffix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
 /// An access path `ω ∈ 𝕍 × (𝔽 ∪ ℂ)*`, e.g. `par_1@getP["cur"]` or
 /// `ret@p.f[π]`. The suffix is shared (`Arc`) because Ascent clones tuple
 /// values freely; extending a path allocates a fresh suffix.
@@ -280,6 +353,22 @@ impl AccessPath {
         Self {
             base,
             accessors: Arc::clone(&self.accessors),
+        }
+    }
+
+    /// This path's accessor sequence, without its root — the thing the
+    /// access-path bound is stated over.
+    pub fn suffix(&self) -> Suffix {
+        Suffix(Arc::clone(&self.accessors))
+    }
+
+    /// This path's root carrying `suffix` instead of its own. The dual of
+    /// [`AccessPath::rebase`], and how a rule that has already built and
+    /// checked a suffix turns it back into a path without rebuilding it.
+    pub fn with_suffix(&self, suffix: &Suffix) -> Self {
+        Self {
+            base: self.base.clone(),
+            accessors: Arc::clone(&suffix.0),
         }
     }
 

@@ -226,7 +226,7 @@ pub fn human(n: usize) -> String {
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::access_path::{AccessPath, Accessor, Base, CritId, PtVal};
+use crate::access_path::{AccessPath, Accessor, Base, CritId, PtVal, Suffix};
 use crate::ir::{Alloc, Const, Field, Proc, Sig, Stmt, Type, Var};
 
 /// Strong count plus weak count, the header every `Arc` allocation carries.
@@ -304,18 +304,28 @@ impl HeapWalk for Accessor {
     }
 }
 
+/// Every path allocates a suffix, including the empty one: `Arc<[T]>` has to
+/// put its counts somewhere. A bare root therefore costs the header alone, and
+/// a deep path costs the header plus its accessors.
+fn walk_suffix(accessors: &Arc<[Accessor]>, p: &mut Payload) {
+    let ptr = Arc::as_ptr(accessors) as *const Accessor as usize;
+    if p.allocation(ptr, std::mem::size_of_val(&**accessors)) {
+        for a in accessors.iter() {
+            a.walk(p);
+        }
+    }
+}
+
 impl HeapWalk for AccessPath {
     fn walk(&self, p: &mut Payload) {
         self.base.walk(p);
-        // Every path allocates a suffix, including the empty one: `Arc<[T]>`
-        // has to put its counts somewhere. A bare root therefore costs the
-        // header alone, and a deep path costs the header plus its accessors.
-        let ptr = Arc::as_ptr(&self.accessors) as *const Accessor as usize;
-        if p.allocation(ptr, std::mem::size_of_val(&*self.accessors)) {
-            for a in self.accessors.iter() {
-                a.walk(p);
-            }
-        }
+        walk_suffix(&self.accessors, p);
+    }
+}
+
+impl HeapWalk for Suffix {
+    fn walk(&self, p: &mut Payload) {
+        walk_suffix(&self.0, p);
     }
 }
 
@@ -367,3 +377,154 @@ tuple_walk![
     (0 A, 1 B, 2 C),
     (0 A, 1 B, 2 C, 3 D),
 ];
+
+// -- the report, against the analysis's own schema ----------------------------
+//
+// Everything above is schema-agnostic: an allocator and a walk. What follows
+// names the relations of [`HybridAnalysis`] once, so that the two reports that
+// want a per-relation breakdown — `examples/memory.rs` over the synthetic
+// families, `examples/ctadl_memory.rs` over an imported APK — cannot drift
+// apart from the schema or from each other.
+
+use crate::analysis::HybridAnalysis;
+use crate::ir::Program;
+
+/// The IDB relations, named once. Counting tuples, sizing the `Vec`, and
+/// walking the `Arc`s behind the tuples all go through this list.
+macro_rules! idb {
+    ($h:expr, $each:ident) => {
+        $each![
+            $h, sig_target, sig_size, mono_target, eff_direct, critical, known_proc,
+            is_called, uncalled, edge, points, path_used, crit_origin, pending,
+            can_propagate, carries, decisive_var, slot_from_formal, will_propagate, stuck,
+            crit_operand, call_crit, load_crit, store_crit, index_crit, decisive_slot,
+            crit_sig, free_root, pub_root, pub_edge, pub_points, root_map, blocked, top,
+            resolve, index_undecidable, index_acc, crit_map, adequate, settled,
+        ]
+    };
+}
+
+/// The EDB relations, likewise. Walked only to mark what the front end already
+/// allocated, never counted — see [`split`].
+macro_rules! edb {
+    ($h:expr, $each:ident) => {
+        $each![
+            $h, procedure, proc_type, proc_sig, entry, in_proc, alloc, alloc_type,
+            const_assign, mov, load_field, store_field, load_static, store_static,
+            load_index_const, store_index_const, load_index_var, store_index_var,
+            direct_call, virtual_call, actual_arg, bind_ret, formal, ret, direct_subtype,
+            lookup, paths, k_limit,
+        ]
+    };
+}
+
+/// Every IDB relation, as `(name, tuples, bytes the `Vec` holds)`.
+///
+/// The byte figure is the `Vec` alone: no `Arc` suffix, no interned symbol, no
+/// index. [`split`] accounts for the rest.
+pub fn idb_relations(h: &HybridAnalysis) -> Vec<(&'static str, usize, usize)> {
+    macro_rules! sizes {
+        ($h:expr, $($name:ident),* $(,)?) => {
+            vec![$((stringify!($name), $h.$name.len(), reserved_bytes(&$h.$name))),*]
+        };
+    }
+    idb!(h, sizes)
+}
+
+/// Total IDB tuples — the denominator for `B/tuple`.
+pub fn idb_tuples(h: &HybridAnalysis) -> usize {
+    idb_relations(h).iter().map(|(_, n, _)| n).sum()
+}
+
+/// Where [`Usage::retained`] went, as `(vecs, payload, indices)`.
+///
+/// `vecs` and `payload` are measured; `indices` is what is left, because
+/// Ascent's index fields are private and cannot be sized from outside. The
+/// EDB is walked first and discarded so that symbols the front end allocated
+/// — which a derived tuple only clones an `Arc` handle to — are not charged to
+/// the fixpoint.
+pub fn split(h: &HybridAnalysis, usage: &Usage) -> (usize, usize, usize) {
+    macro_rules! walk {
+        ($h:expr, $($name:ident),* $(,)?) => {{
+            let mut p = Payload::default();
+            $(p.walk_all(&$h.$name);)*
+            p
+        }};
+    }
+    let mut p = edb!(h, walk);
+    p.restart();
+    macro_rules! walk_into {
+        ($h:expr, $($name:ident),* $(,)?) => {{ $(p.walk_all(&$h.$name);)* }};
+    }
+    idb!(h, walk_into);
+    let payload = p.bytes();
+
+    let vecs: usize = idb_relations(h).iter().map(|(_, _, b)| b).sum();
+    let indices = usage.retained.saturating_sub(vecs + payload);
+    (vecs, payload, indices)
+}
+
+/// Run the fixpoint over `prog`, measuring only `run()`.
+///
+/// `for_program` — which copies the EDB in — happens outside the measured
+/// region, so what is reported is the derivation: the IDB tuples, their `Arc`
+/// payloads, and every index Ascent builds along the way (including the ones
+/// over the EDB, which it builds lazily once the fixpoint starts).
+pub fn run_measured(prog: &Program, k: usize) -> (HybridAnalysis, Usage) {
+    let mut h = HybridAnalysis::for_program(prog, k);
+    let ((), usage) = measure(|| h.run());
+    (h, usage)
+}
+
+/// Print the per-relation table for one finished analysis, plus the three-way
+/// split of what the relations do not explain.
+///
+/// The `Vec`s in the table are the part `relation_sizes_summary()` can see;
+/// the two lines below it are the part it cannot, and between them they are
+/// usually the majority of the memory. A rule edit that changes which columns
+/// a relation is joined on moves the index line and leaves every tuple count
+/// where it was.
+pub fn report(h: &HybridAnalysis, usage: &Usage, edb_facts: usize) {
+    let mut rels = idb_relations(h);
+    rels.retain(|(_, n, _)| *n > 0);
+    rels.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(b.0)));
+
+    let tuples: usize = rels.iter().map(|(_, n, _)| n).sum();
+    let vec_bytes: usize = rels.iter().map(|(_, _, b)| b).sum();
+
+    println!(
+        "  |P| = {edb_facts} EDB facts;  retained {}, peak {}, {} allocations",
+        human(usage.retained),
+        human(usage.peak),
+        usage.allocs
+    );
+    println!("\n  {:<20} {:>8} {:>12} {:>8}", "relation", "tuples", "Vec bytes", "B/tuple");
+    for (name, n, bytes) in &rels {
+        println!(
+            "  {name:<20} {n:>8} {:>12} {:>8.1}",
+            human(*bytes),
+            *bytes as f64 / *n as f64
+        );
+    }
+    println!(
+        "  {:<20} {tuples:>8} {:>12} {:>8.1}",
+        "-- total",
+        human(vec_bytes),
+        vec_bytes as f64 / tuples as f64
+    );
+
+    let (vecs, payload, indices) = split(h, usage);
+    let pct = |n: usize| 100.0 * n as f64 / usage.retained.max(1) as f64;
+    println!("\n  where `retained` went");
+    println!("    tuple Vecs         {:>10}  {:>4.0}%", human(vecs), pct(vecs));
+    println!(
+        "    Arc payloads       {:>10}  {:>4.0}%   suffixes and call strings the fixpoint built",
+        human(payload),
+        pct(payload)
+    );
+    println!(
+        "    Ascent indices     {:>10}  {:>4.0}%   by subtraction: the index fields are private",
+        human(indices),
+        pct(indices)
+    );
+}

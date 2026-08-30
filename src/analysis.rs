@@ -109,7 +109,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use ascent::aggregators::count;
 use ascent::{ascent, ascent_source};
 
-use crate::access_path::{AccessPath, Accessor, Base, Constraint, CritId, PtVal, Summary};
+use crate::access_path::{AccessPath, Accessor, Base, Constraint, CritId, PtVal, Suffix, Summary};
 use crate::ir::{Alloc, ArgIdx, Const, Field, Line, Proc, Program, Sig, Stmt, Type, Var};
 
 // Every rule of the analysis, as a source that `HybridAnalysis` and the
@@ -228,26 +228,35 @@ ascent_source! { hybrid_rules:
         edge(p, sup, sub), if sub.base.is_symbolic();
 
     /// Suffix congruence, `ω ⊇ ω′ ⟹ ω.a ⊇ ω′.a`, applied on demand: only for
-    /// suffixes some path in `p` actually mentions, so the path set stays
-    /// finite.
+    /// suffixes some path in `p` actually mentions.
+    ///
+    /// "On demand" is not on its own a bound. The observed path `ω.a` may
+    /// itself be one this rule invented, so it feeds its own second premise,
+    /// and a cycle in `edge` then lets it extend paths forever. What keeps
+    /// the path set finite is the last premise of each rule below: the
+    /// extended path must be one the EDB's `paths` admits.
     relation path_used(Proc, Base, AccessPath);
     path_used(p.clone(), a.base.clone(), a.clone()) <-- edge(p, a, _);
     path_used(p.clone(), b.base.clone(), b.clone()) <-- edge(p, _, b);
     path_used(p.clone(), a.base.clone(), a.clone()) <-- points(p, a, _);
 
-    edge(p.clone(), sup2.clone(), sub.extend(rest)) <--
+    edge(p.clone(), sup2.clone(), sub.with_suffix(&ext)) <--
         edge(p, sup, sub),
         path_used(p, sup.base, sup2),
         if let Some(rest) = sup2.strip_prefix(sup),
-        if !rest.is_empty();
+        if !rest.is_empty(),
+        let ext = sub.suffix().extended(rest),
+        paths(&ext);
     // The same congruence triggered from the other side: `ret@build ⊇ v` and
     // an observed `v["old"]` together justify `ret@build["old"] ⊇ v["old"]`,
     // which is how a store through a local reaches the published summary.
-    edge(p.clone(), sup.extend(rest), sub2.clone()) <--
+    edge(p.clone(), sup.with_suffix(&ext), sub2.clone()) <--
         edge(p, sup, sub),
         path_used(p, sub.base, sub2),
         if let Some(rest) = sub2.strip_prefix(sub),
-        if !rest.is_empty();
+        if !rest.is_empty(),
+        let ext = sup.suffix().extended(rest),
+        paths(&ext);
 
     // -- pending critical statements: origination and propagation ---------
 
@@ -565,30 +574,38 @@ ascent_source! { hybrid_rules:
     // rooted at the base *operand itself*, extended by the decided accessor.
     // Suffix congruence then carries `ω[c]` down to whatever `ω` stands for,
     // which is what makes the result index-sensitive in the caller.
-    edge(p.clone(), AccessPath::crit_ret(id.clone()), w.extend(std::slice::from_ref(acc))) <--
+    edge(p.clone(), AccessPath::crit_ret(id.clone()), w.with_suffix(&ext)) <--
         index_acc(p, id, acc), load_crit(id),
         let slot = AccessPath::crit_slot(id.clone(), 0),
-        edge(p, slot, w);
+        edge(p, slot, w),
+        let ext = w.suffix().extended(std::slice::from_ref(acc)),
+        paths(&ext);
 
-    edge(p.clone(), w.extend(std::slice::from_ref(acc)), AccessPath::crit_slot(id.clone(), 2)) <--
+    edge(p.clone(), w.with_suffix(&ext), AccessPath::crit_slot(id.clone(), 2)) <--
         index_acc(p, id, acc), store_crit(id),
         let slot = AccessPath::crit_slot(id.clone(), 0),
-        edge(p, slot, w);
+        edge(p, slot, w),
+        let ext = w.suffix().extended(std::slice::from_ref(acc)),
+        paths(&ext);
 
     // The base's *direct* operands above are not enough on their own: they
     // are the local the statement names, and locals are eliminated. A store
     // must also land on every symbolic path the base may denote, or
     // `setP`'s write to `map[key]` would never reach `par_1@setP[c]` and the
     // caller would not see it at all.
-    edge(p.clone(), AccessPath::crit_ret(id.clone()), w.extend(std::slice::from_ref(acc))) <--
+    edge(p.clone(), AccessPath::crit_ret(id.clone()), w.with_suffix(&ext)) <--
         index_acc(p, id, acc), load_crit(id),
         let slot = AccessPath::crit_slot(id.clone(), 0),
-        points(p, slot, ?PtVal::Path(w));
+        points(p, slot, ?PtVal::Path(w)),
+        let ext = w.suffix().extended(std::slice::from_ref(acc)),
+        paths(&ext);
 
-    edge(p.clone(), w.extend(std::slice::from_ref(acc)), AccessPath::crit_slot(id.clone(), 2)) <--
+    edge(p.clone(), w.with_suffix(&ext), AccessPath::crit_slot(id.clone(), 2)) <--
         index_acc(p, id, acc), store_crit(id),
         let slot = AccessPath::crit_slot(id.clone(), 0),
-        points(p, slot, ?PtVal::Path(w));
+        points(p, slot, ?PtVal::Path(w)),
+        let ext = w.suffix().extended(std::slice::from_ref(acc)),
+        paths(&ext);
 
     // =====================================================================
     // Stratum C — reporting. Negation over the finished fixpoint is ordinary
@@ -664,6 +681,14 @@ macro_rules! seed_edb {
         r.ret = prog.ret.clone().into_iter().collect();
         r.direct_subtype = prog.direct_subtype.clone().into_iter().collect();
         r.lookup = prog.lookup.clone().into_iter().collect();
+        // The one EDB relation that is not copied verbatim: a program that
+        // names no bound gets the default one derived from its own syntax,
+        // because an empty `paths` would forbid every field access rather
+        // than every *unnamed* one. See `crate::path_bound`.
+        r.paths = crate::path_bound::for_program(prog)
+            .into_iter()
+            .map(|s| (s,))
+            .collect();
         r.k_limit = ::std::iter::once(($k,)).collect();
     }};
 }
@@ -790,6 +815,49 @@ impl HybridAnalysis {
             .filter(|(q, i, _)| q == p && i == id)
             .map(|(_, _, acc)| acc.clone())
             .collect()
+    }
+}
+
+/// An instrumented twin of [`HybridAnalysis`], for profiling only.
+///
+/// Same rules, from the same [`hybrid_rules`] source, plus two Ascent
+/// attributes:
+///
+/// - `#![measure_rule_times]` — a per-rule timer, so
+///   `scc_times_summary()` reports where the fixpoint actually spends itself,
+///   rule by rule, not just SCC by SCC.
+/// - `#![generate_run_timeout]` — `run_timeout(d)` stops between iterations
+///   once `d` has elapsed and returns `false`. The rule timers have been
+///   accumulating the whole while, so a run that never converges still yields
+///   a complete profile. That is what made the access-path blowup of
+///   `backflash-profile.md` observable at all, back when the fixpoint on a
+///   real APK did not finish.
+///
+/// Behind a feature because the timers cost an `Instant::now()` per rule per
+/// iteration, which has no business in the benchmark targets.
+#[cfg(feature = "profile")]
+pub mod profile {
+    use super::*;
+    use ascent::ascent;
+
+    ascent! {
+        #![measure_rule_times]
+        #![generate_run_timeout]
+        /// Hybrid Inlining, instrumented. See [`super::profile`].
+        pub struct ProfiledHybridAnalysis;
+
+        include_source!(crate::ir::edb);
+        include_source!(crate::analysis::hybrid_rules);
+    }
+
+    impl ProfiledHybridAnalysis {
+        /// As [`HybridAnalysis::for_program`], seeded from the same macro.
+        #[allow(clippy::field_reassign_with_default)]
+        pub fn for_program(prog: &Program, k: usize) -> Self {
+            let mut r = Self::default();
+            seed_edb!(r, prog, k);
+            r
+        }
     }
 }
 

@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hybrid_inlining_paper::access_path::{
-    AccessPath, Accessor, Base, Constraint, CritId, PtVal, Summary,
+    AccessPath, Accessor, Base, Constraint, CritId, PtVal, Suffix, Summary,
 };
 use hybrid_inlining_paper::analysis::{HybridAnalysis, run_hybrid};
 use hybrid_inlining_paper::ir::*;
@@ -781,6 +781,10 @@ fn every_edb_relation_is_copied_into_the_analysis() {
     prog.ret = vec![(p("q"), Var::from("x"))];
     prog.direct_subtype = vec![(Type::from("T"), Type::from("U"))];
     prog.lookup = vec![(Type::from("T"), Sig::from("g"), p("q"))];
+    // Supplied rather than left empty: an empty `paths` means "no bound was
+    // chosen", and `for_program` then derives one instead of copying, which
+    // is the one thing this test must not measure.
+    prog.paths = vec![(Suffix::from(vec![Accessor::Field(Field::from("f"))]),)];
 
     fn sizes(summary: &str) -> BTreeMap<&str, usize> {
         summary
@@ -799,7 +803,7 @@ fn every_edb_relation_is_copied_into_the_analysis() {
 
     assert_eq!(
         declared.len(),
-        25,
+        26,
         "the edb schema changed; update this test"
     );
     for (name, n) in &declared {

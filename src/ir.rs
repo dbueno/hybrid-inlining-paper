@@ -26,6 +26,8 @@ use std::sync::Arc;
 
 use ascent::{ascent, ascent_source};
 
+use crate::access_path::Suffix;
+
 /// Interned-ish string newtypes. `Arc<str>` keeps clones cheap (Ascent clones
 /// tuples freely) and keeps every column `Send + Sync`, so `ascent_par!` stays
 /// available. Swapping in a real interner (`u32` ids) later only touches this
@@ -192,6 +194,33 @@ ascent_source! { edb:
     /// `t` selects implementation `p` — `dispatch(a, proc)` of §4.1.1,
     /// precomputed by the front end from the type hierarchy.
     relation lookup(Type, Sig, Proc);
+
+    // ---------------------------------------------------------------------
+    // The access-path bound
+    // ---------------------------------------------------------------------
+
+    /// `Paths(ω)`: `ω` is an access path the analysis is allowed to build.
+    ///
+    /// The paper's abstract domain is `𝕍 × (𝔽 ∪ ℂ)*` — access paths of
+    /// unbounded length — and a field-sensitive closure over it has no
+    /// fixpoint on real code (see `backflash-profile.md`). This relation is
+    /// the bound: it is the analysis's whole access-path vocabulary, fixed
+    /// before the fixpoint starts, and every path a rule constructs is tested
+    /// against it before it may enter `edge` or `points`.
+    ///
+    /// A path is listed *root-free*, as its accessor sequence alone. Roots
+    /// cannot be enumerated in advance — a placeholder root carries a call
+    /// string the fixpoint invents — and they are not what grows: renaming a
+    /// root keeps the suffix, so the suffix is the only thing a bound has to
+    /// constrain.
+    ///
+    /// Two requirements on whatever supplies it. It must contain `ε`, or a
+    /// bare root would be unrepresentable; and it must be prefix-closed, or a
+    /// path would be admissible while the intermediate paths the rules build
+    /// it out of were not. How it is computed is no business of this schema —
+    /// [`crate::path_bound`] is the default, used when a program leaves this
+    /// relation empty.
+    relation paths(Suffix);
 }
 
 ascent! {

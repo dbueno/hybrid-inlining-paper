@@ -1,9 +1,9 @@
 //! Complexity regression guards.
 //!
-//! `examples/complexity.rs` and `examples/parallel.rs` produce the full
-//! picture; this file pins the handful of facts that a rule edit must not
-//! change silently. Each test states the shape it is defending and why, so a
-//! failure says what was given up rather than just which number moved.
+//! `examples/complexity.rs` and `cargo bench` produce the full picture; this
+//! file pins the handful of facts that a rule edit must not change silently.
+//! Each test states the shape it is defending and why, so a failure says what
+//! was given up rather than just which number moved.
 //!
 //! Sizes are kept small deliberately: these run in a debug build.
 
@@ -215,8 +215,10 @@ fn recursion_through_a_field_load_terminates() {
 }
 
 /// The two parallel backends must derive exactly what the sequential one
-/// does. This is what lets `examples/parallel.rs` be read as a timing
-/// comparison rather than a comparison of two different analyses.
+/// does. This is what lets `benches/backends.rs` be read as a timing
+/// comparison rather than a comparison of two different analyses. That bench
+/// re-checks the same property at its own (much larger) sizes; this test
+/// pins it cheaply, in a debug build, on every `cargo test`.
 #[test]
 fn parallel_backends_derive_the_same_relations() {
     let cases: Vec<(&str, Program, usize)> = vec![

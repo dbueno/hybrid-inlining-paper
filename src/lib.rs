@@ -4,3 +4,4 @@ pub mod families;
 pub mod figure1;
 pub mod figure5;
 pub mod ir;
+pub mod mem;

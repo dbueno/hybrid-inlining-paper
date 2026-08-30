@@ -1,0 +1,338 @@
+//! What the Hybrid Inlining fixpoint costs in bytes, family by family.
+//!
+//! `examples/complexity.rs` fits `|R| ~ |P|^d` over tuple counts and
+//! `cargo bench` measures wall time. Neither answers "did that rule edit make
+//! the relations leaner": a tuple is not a fixed number of bytes here (access
+//! paths and call strings carry `Arc` payloads that grow with the program),
+//! and Ascent stores every relation as tuples *plus* private index maps that
+//! `relation_sizes_summary()` never mentions. Both are counted at the
+//! allocator — see [`hybrid_inlining_paper::mem`].
+//!
+//! ```text
+//! cargo run --release --example memory
+//! ```
+//!
+//! Two columns per family carry the message:
+//!
+//! - `B/tuple` — retained heap per derived fact, indices included. Rising with
+//!   `n` means the tuples themselves are getting fatter, which tuple counts
+//!   cannot show.
+//! - the `retained ~ |P|^d` fit against the `tuples ~ |P|^d` fit beside it.
+//!   Bytes growing with a bigger exponent than tuples is the signature of a
+//!   relation whose *elements* grow: `fields_chain` is the worst case, and
+//!   the reason `hi-complexity.md` argues for a depth limit on access paths.
+//!
+//! Re-run after editing the rules and compare against the numbers you kept.
+//! `cargo bench --bench memory` measures the same quantity under criterion,
+//! where `--save-baseline`/`--baseline` does the comparing for you.
+
+use hybrid_inlining_paper::analysis::HybridAnalysis;
+use hybrid_inlining_paper::families::*;
+use hybrid_inlining_paper::figure1;
+use hybrid_inlining_paper::ir::Program;
+use hybrid_inlining_paper::mem::{Counting, Payload, Usage, human, measure, reserved_bytes};
+
+#[global_allocator]
+static ALLOC: Counting = Counting;
+
+/// The IDB relations, named once. Everything the report does per relation —
+/// counting tuples, sizing the `Vec`, walking the `Arc`s behind the tuples —
+/// goes through this list, so none of them can fall behind the schema
+/// separately.
+macro_rules! idb {
+    ($h:expr, $each:ident) => {
+        $each![
+            $h, sig_target, sig_size, mono_target, eff_direct, critical, known_proc,
+            is_called, uncalled, edge, points, path_used, crit_origin, pending,
+            can_propagate, carries, decisive_var, slot_from_formal, will_propagate, stuck,
+            crit_operand, call_crit, load_crit, store_crit, index_crit, decisive_slot,
+            crit_sig, free_root, pub_root, pub_edge, pub_points, root_map, blocked, top,
+            resolve, index_undecidable, index_acc, crit_map, adequate, settled,
+        ]
+    };
+}
+
+/// The EDB relations, likewise. Walked only to mark what the front end already
+/// allocated, never counted — see [`split`].
+macro_rules! edb {
+    ($h:expr, $each:ident) => {
+        $each![
+            $h, procedure, proc_type, proc_sig, entry, in_proc, alloc, alloc_type,
+            const_assign, mov, load_field, store_field, load_static, store_static,
+            load_index_const, store_index_const, load_index_var, store_index_var,
+            direct_call, virtual_call, actual_arg, bind_ret, formal, ret, direct_subtype,
+            lookup, k_limit,
+        ]
+    };
+}
+
+/// Every IDB relation, as `(name, tuples, bytes the `Vec` holds)`.
+///
+/// The byte figure is the `Vec` alone: no `Arc` suffix, no interned symbol, no
+/// index. [`split`] accounts for the rest.
+fn idb_relations(h: &HybridAnalysis) -> Vec<(&'static str, usize, usize)> {
+    macro_rules! sizes {
+        ($h:expr, $($name:ident),* $(,)?) => {
+            vec![$((stringify!($name), $h.$name.len(), reserved_bytes(&$h.$name))),*]
+        };
+    }
+    idb!(h, sizes)
+}
+
+/// Where [`Usage::retained`] went, in three parts.
+///
+/// `vecs` and `payload` are measured; `indices` is what is left, because
+/// Ascent's index fields are private and cannot be sized from outside. The
+/// EDB is walked first and discarded so that symbols the front end allocated
+/// — which a derived tuple only clones an `Arc` handle to — are not charged to
+/// the fixpoint.
+fn split(h: &HybridAnalysis, usage: &Usage) -> (usize, usize, usize) {
+    macro_rules! walk {
+        ($h:expr, $($name:ident),* $(,)?) => {{
+            let mut p = Payload::default();
+            $(p.walk_all(&$h.$name);)*
+            p
+        }};
+    }
+    let mut p = edb!(h, walk);
+    p.restart();
+    macro_rules! walk_into {
+        ($h:expr, $($name:ident),* $(,)?) => {{ $(p.walk_all(&$h.$name);)* }};
+    }
+    idb!(h, walk_into);
+    let payload = p.bytes();
+
+    let vecs: usize = idb_relations(h).iter().map(|(_, _, b)| b).sum();
+    let indices = usage.retained.saturating_sub(vecs + payload);
+    (vecs, payload, indices)
+}
+
+/// Run the fixpoint over `prog`, measuring only `run()`.
+///
+/// `for_program` — which copies the EDB in — happens outside the measured
+/// region, so what is reported is the derivation: the IDB tuples, their `Arc`
+/// payloads, and every index Ascent builds along the way (including the ones
+/// over the EDB, which it builds lazily once the fixpoint starts).
+fn run_measured(prog: &Program, k: usize) -> (HybridAnalysis, Usage) {
+    let mut h = HybridAnalysis::for_program(prog, k);
+    let ((), usage) = measure(|| h.run());
+    (h, usage)
+}
+
+/// Total IDB tuples — the denominator for `B/tuple`.
+fn idb_tuples(h: &HybridAnalysis) -> usize {
+    idb_relations(h).iter().map(|(_, n, _)| n).sum()
+}
+
+/// Per-relation table for one program, plus what the relations do not explain.
+fn breakdown(label: &str, prog: &Program, k: usize) {
+    let (h, usage) = run_measured(prog, k);
+    let mut rels = idb_relations(&h);
+    rels.retain(|(_, n, _)| *n > 0);
+    rels.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(b.0)));
+
+    let tuples: usize = rels.iter().map(|(_, n, _)| n).sum();
+    let vec_bytes: usize = rels.iter().map(|(_, _, b)| b).sum();
+
+    println!("\n## {label}");
+    println!(
+        "  |P| = {} EDB facts;  retained {}, peak {}, {} allocations",
+        edb_size(prog),
+        human(usage.retained),
+        human(usage.peak),
+        usage.allocs
+    );
+    println!("\n  {:<20} {:>8} {:>12} {:>8}", "relation", "tuples", "Vec bytes", "B/tuple");
+    for (name, n, bytes) in &rels {
+        println!(
+            "  {name:<20} {n:>8} {:>12} {:>8.1}",
+            human(*bytes),
+            *bytes as f64 / *n as f64
+        );
+    }
+    println!(
+        "  {:<20} {tuples:>8} {:>12} {:>8.1}",
+        "-- total",
+        human(vec_bytes),
+        vec_bytes as f64 / tuples as f64
+    );
+    // Where the rest of `retained` is. The `Vec`s above are the part
+    // `relation_sizes_summary()` can see; the other two lines are the part it
+    // cannot, and between them they are the majority of the memory. A rule
+    // edit that changes which columns a relation is joined on moves the index
+    // line and leaves every tuple count where it was.
+    let (vecs, payload, indices) = split(&h, &usage);
+    let pct = |n: usize| 100.0 * n as f64 / usage.retained.max(1) as f64;
+    println!("\n  where `retained` went");
+    println!("    tuple Vecs         {:>10}  {:>4.0}%", human(vecs), pct(vecs));
+    println!(
+        "    Arc payloads       {:>10}  {:>4.0}%   suffixes and call strings the fixpoint built",
+        human(payload),
+        pct(payload)
+    );
+    println!(
+        "    Ascent indices     {:>10}  {:>4.0}%   by subtraction: the index fields are private",
+        human(indices),
+        pct(indices)
+    );
+}
+
+/// Least-squares slope of `log y` against `log x`. Same fit as
+/// `examples/complexity.rs`, so the exponents are comparable.
+fn exponent(xs: &[f64], ys: &[f64]) -> f64 {
+    let pts: Vec<(f64, f64)> = xs
+        .iter()
+        .zip(ys)
+        .filter(|(_, y)| **y > 0.0)
+        .map(|(x, y)| (x.ln(), y.ln()))
+        .collect();
+    if pts.len() < 2 {
+        return 0.0;
+    }
+    let n = pts.len() as f64;
+    let mx = pts.iter().map(|q| q.0).sum::<f64>() / n;
+    let my = pts.iter().map(|q| q.1).sum::<f64>() / n;
+    let num: f64 = pts.iter().map(|(x, y)| (x - mx) * (y - my)).sum();
+    let den: f64 = pts.iter().map(|(x, _)| (x - mx).powi(2)).sum();
+    if den == 0.0 { 0.0 } else { num / den }
+}
+
+struct Row {
+    n: usize,
+    edb: usize,
+    tuples: usize,
+    usage: Usage,
+}
+
+fn sweep(label: &str, note: &str, ns: &[usize], build: impl Fn(usize) -> (Program, usize)) {
+    let rows: Vec<Row> = ns
+        .iter()
+        .map(|&n| {
+            let (prog, k) = build(n);
+            let edb = edb_size(&prog);
+            let (h, usage) = run_measured(&prog, k);
+            let tuples = idb_tuples(&h);
+            drop(h);
+            Row { n, edb, tuples, usage }
+        })
+        .collect();
+
+    println!("\n\n### {label} — {note}");
+    let cell = |s: String| format!("{s:>10}");
+    let line = |name: &str, f: &dyn Fn(&Row) -> String| {
+        println!(
+            "  {name:<12}{}",
+            rows.iter().map(|r| cell(f(r))).collect::<Vec<_>>().join("")
+        );
+    };
+    line("n", &|r| r.n.to_string());
+    line("|P|", &|r| r.edb.to_string());
+    line("tuples", &|r| r.tuples.to_string());
+    line("retained", &|r| human(r.usage.retained));
+    line("peak", &|r| human(r.usage.peak));
+    line("B/tuple", &|r| format!("{:.1}", r.usage.bytes_per(r.tuples)));
+
+    let xs: Vec<f64> = rows.iter().map(|r| r.edb as f64).collect();
+    let tup = exponent(&xs, &rows.iter().map(|r| r.tuples as f64).collect::<Vec<_>>());
+    let bytes = exponent(
+        &xs,
+        &rows.iter().map(|r| r.usage.retained as f64).collect::<Vec<_>>(),
+    );
+    println!("  fit:        tuples ~ |P|^{tup:.2}   retained ~ |P|^{bytes:.2}");
+
+    // The exponents are the coarse signal; `B/tuple` is the sensitive one.
+    // A family whose tuples stay the same shape holds it flat to about a
+    // percent across a sweep spanning an order of magnitude (`wide` goes 816
+    // to 824), so a sixth more bytes per tuple at the far end is the
+    // access-path suffix — or the call string — growing with the program,
+    // not measurement slack.
+    let (first, last) = (&rows[0], rows.last().unwrap());
+    let growth = last.usage.bytes_per(last.tuples) / first.usage.bytes_per(first.tuples).max(1.0);
+    if growth >= 1.15 {
+        println!(
+            "              <== {growth:.2}x the bytes per tuple over the sweep: \
+             the tuples themselves are growing"
+        );
+    }
+}
+
+fn main() {
+    println!("# Heap cost of the fixpoint");
+    println!(
+        "\nBytes are what the program asked the allocator for: no size-class\n\
+         rounding, no per-allocation header, so RSS runs above these. Measured\n\
+         over `run()` only — building the analysis and copying the EDB in is\n\
+         outside the measured region."
+    );
+
+    breakdown("Figure 1 (k = 4)", &figure1::program(), 4);
+    breakdown("wide(512, 8)", &wide(512, 8), 0);
+    breakdown("fields_chain(32)", &fields_chain(32), 0);
+
+    sweep(
+        "chain(n), k = n+2",
+        "call chain of depth n above one critical virtual call",
+        &[2, 4, 8, 16, 32],
+        |n| (chain(n, 2), n + 2),
+    );
+    sweep(
+        "chain(n), k = 2",
+        "the same chain with the k-limit held fixed",
+        &[2, 4, 8, 16, 32],
+        |n| (chain(n, 2), 2),
+    );
+    sweep(
+        "fanin(m), k = 3",
+        "one critical procedure called from m distinct callers",
+        &[2, 4, 8, 16, 32],
+        |m| (fanin(m, 2), 3),
+    );
+    sweep(
+        "branching(d), k = d+2",
+        "each level calls the one below from two sites",
+        &[1, 2, 3, 4, 5, 6, 7, 8],
+        |d| (branching(d, 2), d + 2),
+    );
+    sweep(
+        "branching(d), k = 3",
+        "the same, with the k-limit capping the call string",
+        &[1, 2, 3, 4, 5, 6, 7, 8],
+        |d| (branching(d, 2), 3),
+    );
+    sweep(
+        "targets(t), k = 2",
+        "one critical call with t CHA implementations, unpinned",
+        &[2, 4, 8, 16, 32],
+        |t| (targets(t), 2),
+    );
+    sweep(
+        "alias(n)",
+        "n allocations merged into a chain of n variables; no calls",
+        &[4, 8, 16, 32, 64],
+        |n| (alias(n), 0),
+    );
+    sweep(
+        "fields(n)",
+        "chain of n distinct field loads off a parameter",
+        &[2, 4, 8, 16, 32, 64],
+        |n| (fields(n), 0),
+    );
+    sweep(
+        "fields_chain(n)",
+        "n procedures, each appending one accessor to the callee's path",
+        &[2, 4, 8, 16, 32],
+        |n| (fields_chain(n), 0),
+    );
+    sweep(
+        "wide(m, 8)",
+        "m procedures with a nontrivial local closure each; nothing critical",
+        &[4, 8, 16, 32, 64],
+        |m| (wide(m, 8), 0),
+    );
+    sweep(
+        "wide(64, w)",
+        "64 procedures, local closure of width w in each",
+        &[2, 4, 8, 16],
+        |w| (wide(64, w), 0),
+    );
+}

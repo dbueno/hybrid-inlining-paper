@@ -22,6 +22,11 @@
             pre-commit
             rustPackages.clippy
 
+            # criterion picks this up at run time for `cargo bench` plots;
+            # without it on PATH it prints "Gnuplot not found" and falls back
+            # to the built-in plotters backend.
+            gnuplot
+
             # PDF reading: text extraction + page/figure rendering
             poppler-utils # pdftotext, pdftoppm, pdfimages, pdfinfo
             mupdf         # mutool: structured text (JSON/HTML), draw

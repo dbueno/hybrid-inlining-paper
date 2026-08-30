@@ -2,9 +2,35 @@
 name = "hybrid-inlining-paper"
 version = "0.1.0"
 edition = "2024"
+# `benches/common/` is a shared module, not a bench target, so the two bench
+# targets are declared by hand rather than discovered.
+autobenches = false
 
 [dependencies]
 ascent = "0.8.0"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+# `test = false`: cargo would otherwise run every benchmark once under
+# `cargo test`, and these sweeps are far too large for that. Correctness of
+# the rules lives in `tests/`; `cargo bench -- --test` is the smoke run.
+[[bench]]
+name = "backends"
+harness = false
+test = false
+
+[[bench]]
+name = "families"
+harness = false
+test = false
+
+# `memory` installs a counting global allocator, which the wall-time targets
+# must not: it adds an atomic RMW to every allocation.
+[[bench]]
+name = "memory"
+harness = false
+test = false
 
 [profile.release]
 strip = "symbols"

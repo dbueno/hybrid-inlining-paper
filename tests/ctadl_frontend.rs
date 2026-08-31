@@ -23,7 +23,7 @@ use ctadl_ir::mir::call::{
 use ctadl_ir::mir::{Exp, FunctionData, ParameterType, Program as CirProgram, Symbol};
 
 use hybrid_inlining_paper::analysis::run_hybrid;
-use hybrid_inlining_paper::ctadl::{Options, Translator};
+use hybrid_inlining_paper::ctadl::{Options, Preprocess, Translator};
 use hybrid_inlining_paper::ir::{Proc, Program, Var};
 
 const OBJ: &str = "LObj;";
@@ -210,9 +210,12 @@ fn figure1_cir() -> (CirProgram, VirtualMethodTable) {
     (CirProgram::new(ctadl_ir::mir::Functions::new(fns)), vmt)
 }
 
-fn translate() -> Program {
+fn translate_with(pre: Preprocess) -> Program {
     let (cir, vmt) = figure1_cir();
-    let mut t = Translator::new(Options::default());
+    let mut t = Translator::new(Options {
+        preprocess: pre,
+        ..Options::default()
+    });
     t.add_import(cir, &vmt);
     t.finish()
 }
@@ -222,9 +225,44 @@ fn v(local: &str, proc: &str) -> Var {
     Var::from(format!("{local}@{proc}"))
 }
 
+/// The one SSA version of `local` in `proc`. Under [`Preprocess::none`] that
+/// is `v(local, proc)` itself; with SSA on, the name carries a version this
+/// test has no way to predict, so it is found rather than spelled — and the
+/// finding doubles as an assertion, since every local named here is assigned
+/// exactly once and must therefore have exactly one version.
+fn sole_version(prog: &Program, local: &str, proc: &str) -> Var {
+    let plain = v(local, proc);
+    let versioned = format!("{local}#");
+    let suffix = format!("@{proc}");
+
+    // Every relation that can define a variable. `second` and `third` are
+    // defined by `bind_ret`, not by an assignment, so that one matters.
+    let mut found: BTreeSet<Var> = prog
+        .mov
+        .iter()
+        .map(|(_, to, _)| to.clone())
+        .chain(prog.alloc.iter().map(|(_, to, _)| to.clone()))
+        .chain(prog.const_assign.iter().map(|(_, to, _)| to.clone()))
+        .chain(prog.bind_ret.iter().map(|(_, to)| to.clone()))
+        .filter(|var| {
+            let n = var.to_string();
+            *var == plain || (n.starts_with(&versioned) && n.ends_with(&suffix))
+        })
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "`{local}` in {proc} should have exactly one definition, found {found:?}"
+    );
+    found.pop_first().unwrap()
+}
+
 #[test]
 fn structure_survives_the_translation() {
-    let prog = translate();
+    // Exact variable names, so this one is pinned to the raw translation;
+    // `the_default_preprocessing_preserves_the_result` covers the shipped
+    // configuration.
+    let prog = translate_with(Preprocess::none());
 
     let procs: BTreeSet<String> = prog.procedure.iter().map(|(p,)| p.to_string()).collect();
     assert_eq!(procs.len(), 8, "every function with a body is a procedure");
@@ -274,11 +312,25 @@ fn structure_survives_the_translation() {
 
 #[test]
 fn figure1_result_survives_the_translation() {
-    let prog = translate();
+    check_figure1_result(Preprocess::none());
+}
+
+/// The same acceptance test under the shipped default — CTADL's four IR
+/// passes. SSA renames every local, so the paper's result has to survive a
+/// translation whose variable names this test cannot predict; that it does is
+/// the property the default rests on.
+#[test]
+fn the_default_preprocessing_preserves_the_result() {
+    assert_eq!(Options::default().preprocess, Preprocess::ctadl());
+    check_figure1_result(Preprocess::ctadl());
+}
+
+fn check_figure1_result(pre: Preprocess) {
+    let prog = translate_with(pre);
     let h = run_hybrid(&prog, 4);
 
     let pt = |local: &str| -> BTreeSet<String> {
-        h.points_to(&Proc::from(SERVICE), v(local, SERVICE))
+        h.points_to(&Proc::from(SERVICE), sole_version(&prog, local, SERVICE))
             .iter()
             .map(ToString::to_string)
             .collect()

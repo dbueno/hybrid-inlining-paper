@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use hybrid_inlining_paper::analysis::profile::ProfiledHybridAnalysis;
 use hybrid_inlining_paper::access_path::AccessPath;
-use hybrid_inlining_paper::ctadl::{Options, Translator, read_import, restrict};
+use hybrid_inlining_paper::ctadl::{Options, Preprocess, Translator, read_import, restrict};
 use hybrid_inlining_paper::ir::Proc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -28,6 +28,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut timeout = 60u64;
     let mut max_procs: Option<usize> = None;
     let mut top_paths = 0usize;
+
+    let mut opts = Options::default();
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -39,10 +41,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "-h" | "--help" => {
                 eprintln!(
                     "usage: ctadl_profile <import>... [--k N] [--timeout SECS] \
-                     [--max-procs N] [--top-paths N]"
+                     [--max-procs N] [--top-paths N] [--ssa] [--no-preprocess]"
                 );
                 return Ok(());
             }
+            // The IR passes `ctadl index` runs before codegen are on by
+            // default. `--no-preprocess` is the ablation this repo's earlier
+            // measurements were taken under; `--ssa` is SSA without the three
+            // shrinking passes around it.
+            "--ssa" => opts.preprocess = Preprocess::ssa_only(),
+            "--ctadl-pre" => opts.preprocess = Preprocess::ctadl(),
+            "--no-preprocess" => opts.preprocess = Preprocess::none(),
             _ => imports.push(a),
         }
     }
@@ -51,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let mut t = Translator::new(Options::default());
+    let mut t = Translator::new(opts.clone());
     for name in &imports {
         let (cir, vmt) = read_import(name)?;
         t.add_import(cir, &vmt);

@@ -11,7 +11,7 @@
 //! translated into one fact base.
 
 use hybrid_inlining_paper::analysis::run_hybrid;
-use hybrid_inlining_paper::ctadl::{Options, Translator, read_import};
+use hybrid_inlining_paper::ctadl::{Options, Preprocess, Translator, read_import};
 use hybrid_inlining_paper::ir::Program;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,7 +23,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--ssa" => opts.ssa = true,
+            "--ssa" => opts.preprocess = Preprocess::ssa_only(),
+            "--ctadl-pre" => opts.preprocess = Preprocess::ctadl(),
+            "--no-preprocess" => opts.preprocess = Preprocess::none(),
             "--compact" => opts.compact_names = true,
             "--no-cha-fallback" => opts.cha_fallback = false,
             "--run" => run = true,
@@ -31,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "-h" | "--help" => {
                 eprintln!(
                     "usage: ctadl_import <import|dir>... [--ssa] [--compact] \
-                     [--no-cha-fallback] [--run] [--k N]"
+                     [--no-preprocess] [--no-cha-fallback] [--run] [--k N]"
                 );
                 return Ok(());
             }

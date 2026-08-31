@@ -28,7 +28,7 @@
 //! says otherwise — which is what a sweep over `k` at a fixed, small size
 //! wants, since the whole program does not converge at `k >= 3`.
 
-use hybrid_inlining_paper::ctadl::{Options, Translator, read_import, restrict};
+use hybrid_inlining_paper::ctadl::{Options, Preprocess, Translator, read_import, restrict};
 use hybrid_inlining_paper::families::edb_size;
 use hybrid_inlining_paper::ir::Program;
 use hybrid_inlining_paper::mem::{Counting, Usage, human, idb_tuples, report, run_measured};
@@ -42,6 +42,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sizes: Vec<usize> = Vec::new();
     let mut whole_too = true;
 
+    let mut opts = Options::default();
+
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -50,10 +52,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--no-whole" => whole_too = false,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: ctadl_memory <import>... [--k N] [--max-procs N]... [--no-whole]"
+                    "usage: ctadl_memory <import>... [--k N] [--max-procs N]... \
+                     [--no-whole] [--ssa] [--no-preprocess]"
                 );
                 return Ok(());
             }
+            // The IR passes `ctadl index` runs before codegen are on by
+            // default. `--no-preprocess` is the ablation this repo's earlier
+            // measurements were taken under; `--ssa` is SSA without the three
+            // shrinking passes around it.
+            "--ssa" => opts.preprocess = Preprocess::ssa_only(),
+            "--ctadl-pre" => opts.preprocess = Preprocess::ctadl(),
+            "--no-preprocess" => opts.preprocess = Preprocess::none(),
             _ => imports.push(a),
         }
     }
@@ -62,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let mut t = Translator::new(Options::default());
+    let mut t = Translator::new(opts.clone());
     for name in &imports {
         let (cir, vmt) = read_import(name)?;
         t.add_import(cir, &vmt);

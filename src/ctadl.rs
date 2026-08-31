@@ -173,13 +173,87 @@ pub fn import_edb(dir: impl AsRef<Path>, opts: Options) -> Result<Program, Error
 // Options
 // =========================================================================
 
+/// The IR-to-IR passes `ctadl index` runs between reading an import and
+/// generating facts, in its order (`ctadl-ascent/src/cli/mod.rs:301-304`).
+///
+/// They are exposed one at a time rather than as a single switch because the
+/// comparison in `ctadl-comparison.md` wants the ablation: SSA *grows* the
+/// program, the other three shrink it, and lumping them together hides which
+/// way the fact count moves. [`Preprocess::ctadl`] is the whole pipeline, and
+/// is what "the same front end as `ctadl index`" means.
+///
+/// All four preserve taint-flow semantics, and all four are documented as
+/// no-ops on IR that is already in SSA form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Preprocess {
+    /// Delete assigned-but-never-read temporaries. Runs first: a dead temp has
+    /// no use for coalescing to fuse it into.
+    pub dead_temps: bool,
+
+    /// Fuse single-use copy temporaries into their use.
+    pub coalesce: bool,
+
+    /// `ctadl_ir::ssa::transform_program`, so every variable is versioned and
+    /// `Phi` nodes appear. The analysis here is flow-insensitive, so this only
+    /// buys the extra precision of not merging a variable's versions — at the
+    /// cost of a larger variable space. It also gives the function a single
+    /// exit block, which collapses [`ret`](crate::ir::edb) to one fact.
+    pub ssa: bool,
+
+    /// Propagate the copies SSA introduced but coalescing could not fuse.
+    /// Post-SSA, so it is the one pass that must follow `ssa` to do anything.
+    pub copy_prop: bool,
+}
+
+/// CTADL's pipeline. This is the default because running it is worth 3.7× in
+/// time and 3.9× in memory on `backflash.apk` at `k = 1`, for no lost dispatch
+/// precision — see `ctadl-comparison.md`. Translating the IR exactly as
+/// `ctadl import` cached it is the ablation, [`Preprocess::none`], not the
+/// baseline.
+impl Default for Preprocess {
+    fn default() -> Self {
+        Preprocess::ctadl()
+    }
+}
+
+impl Preprocess {
+    /// Every pass `ctadl index` runs, which is all four. The default.
+    pub fn ctadl() -> Self {
+        Preprocess {
+            dead_temps: true,
+            coalesce: true,
+            ssa: true,
+            copy_prop: true,
+        }
+    }
+
+    /// No preprocessing: the IR as `ctadl import` cached it. Kept for the
+    /// ablation in `examples/dispatch_diff.rs` and for front ends that have
+    /// already run their own passes.
+    pub fn none() -> Self {
+        Preprocess {
+            dead_temps: false,
+            coalesce: false,
+            ssa: false,
+            copy_prop: false,
+        }
+    }
+
+    /// SSA alone, with none of the shrinking passes around it.
+    pub fn ssa_only() -> Self {
+        Preprocess {
+            ssa: true,
+            ..Preprocess::none()
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
-    /// Run `ctadl_ir::ssa::transform_program` first, so every variable is
-    /// versioned and `Phi` nodes appear. The analysis here is flow-insensitive,
-    /// so this only buys the extra precision of not merging a variable's
-    /// versions — at the cost of a larger variable space.
-    pub ssa: bool,
+    /// Which of CTADL's pre-codegen IR passes to run. Defaults to all four,
+    /// matching `ctadl index`; [`Preprocess::none`] translates the IR exactly
+    /// as `ctadl import` cached it.
+    pub preprocess: Preprocess,
 
     /// When the declared class at a virtual call is unknown to the hierarchy —
     /// routine for library types an APK does not ship — fall back to every
@@ -197,7 +271,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Options {
-            ssa: false,
+            preprocess: Preprocess::default(),
             cha_fallback: true,
             compact_names: false,
         }
@@ -319,8 +393,20 @@ impl Translator {
 
     /// Translate one import's IR, merging it into what is already here.
     pub fn add_import(&mut self, mut cir: CirProgram, vmt: &VirtualMethodTable) {
-        if self.opts.ssa {
+        // CTADL's order, and its `prune_unreachable_cfg_nodes` default of
+        // `true`. Each guard is separate so an ablation can run one pass.
+        let pre = self.opts.preprocess;
+        if pre.dead_temps {
+            ctadl_ir::ssa::eliminate_dead_temps(&mut cir);
+        }
+        if pre.coalesce {
+            ctadl_ir::ssa::coalesce_copies(&mut cir);
+        }
+        if pre.ssa {
             ctadl_ir::ssa::transform_program(&mut cir, true);
+        }
+        if pre.copy_prop {
+            ctadl_ir::ssa::propagate_copies(&mut cir);
         }
         self.cha.add_vmt(vmt);
 
@@ -678,7 +764,17 @@ impl Translator {
     /// cross-procedure join.
     fn var(&mut self, f: &FunctionData, v: &VariableRef) -> Var {
         let name = match &*v.variable {
-            Variable::Param(i) => return self.param_var(i.index()),
+            // The *unversioned* parameter is the incoming value, and is what
+            // `formal` names. Without SSA every reference is unversioned and
+            // this is the only case. With SSA every use is versioned and the
+            // entry block anchors them with `par_i#0 = par_i`, so the versions
+            // have to stay distinct from the formal — collapsing them here
+            // would merge every write to a parameter back into its incoming
+            // value and throw away exactly the precision SSA was run for.
+            Variable::Param(i) => match v.version {
+                None => return self.param_var(i.index()),
+                Some(_) => format!("par{}", i.index()),
+            },
             Variable::Local(i) => match f.locals.get(*i) {
                 Some(d) => d.name.clone(),
                 None => format!("local{}", i.index()),

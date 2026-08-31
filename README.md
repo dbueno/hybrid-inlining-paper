@@ -21,8 +21,8 @@ local data flow, which is finite because a concatenation step always moves
 backward through the statement order.
 
 The bound is a precision knob and the module documents which precision it
-gives up. On `backflash.apk` the whole 29,166-statement program has a
-vocabulary of 741 suffixes and the analysis converges in 3.6 seconds.
+gives up. On `backflash.apk` the whole 41,143-statement program has a
+vocabulary of 736 suffixes and the analysis converges in 0.55 seconds.
 
 ## Analyzing real code
 
@@ -37,6 +37,13 @@ ctadl import --name app app.apk                       # once, in ../ctadl-rs
 cargo run --features ctadl --release --example ctadl_import -- app
 cargo run --features ctadl --release --example ctadl_import -- app --run --k 2
 ```
+
+Before translating, the front end runs the same four IR passes `ctadl index`
+runs — dead-temporary elimination, copy coalescing, SSA, copy propagation. That
+is the default because it is worth 3.7× in time and 3.9× in memory at `k = 1`
+on `backflash.apk`, for no lost dispatch precision; `ctadl-comparison.md`
+measures it. `--no-preprocess` turns them off and translates the IR exactly as
+`ctadl import` cached it.
 
 The feature is off by default because `ctadl-ir` pulls in arrow and parquet;
 without it the crate still builds in seconds.

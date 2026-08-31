@@ -1,17 +1,23 @@
 # Summary
 
 
-Critical statements start off in `crit_origin`. That's how they enter `pending`.
-Calls to `pending` procs are also put into pending (if they obey the k-limit).
-If a call from `p` to `callee` is resolved, and `callee` was pending, then `p` is marked pending with the nested id.
+**Pending**: Critical statements start off in `crit_origin`. That's how they enter `pending`. They
+have a `CritId` that holds the critical statement and a stack (initially empty). Calls to `pending`
+procs are also put into pending (if they obey the k-limit), pushing into the Id's stack. Resolving
+calls enables `pending` entries: if a callee is pending and we resolve a call to it, then add a new
+pending entry with the nested stack.
+
+**Publishing**:
+`Base` are variables
+`pub_edge` contains data flow summary edges
+- `pub_root` has formals/ret plus "p
+
 
 - `uncalled(p)` is only the statically uncalled things; how is this used?
 - `edge` is intraprocedural constraints `sub ⊇ sub`. It is interesting because it gets edges
   depending on the critical statements as well; edges to actuals, for example. edge gets
   instantiated based on calls and published edges after substitution into the calling context.
 - `can_propagate` is $k$-limited
-- `pub_edge` contains data flow summary edges
-- `pub_root` has formals/ret plus "p
 
 ## Questions
 

@@ -23,6 +23,10 @@
 //! cargo run --features ctadl --release --example ctadl_memory -- \
 //!     backflash.apk --k 1 --max-procs 100 --max-procs 400 --max-procs 1000
 //! ```
+//!
+//! The whole program is always measured as well, last, unless `--no-whole`
+//! says otherwise — which is what a sweep over `k` at a fixed, small size
+//! wants, since the whole program does not converge at `k >= 3`.
 
 use hybrid_inlining_paper::ctadl::{Options, Translator, read_import, restrict};
 use hybrid_inlining_paper::families::edb_size;
@@ -36,14 +40,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut imports: Vec<String> = Vec::new();
     let mut k = 1usize;
     let mut sizes: Vec<usize> = Vec::new();
+    let mut whole_too = true;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--k" => k = args.next().unwrap_or_default().parse()?,
             "--max-procs" => sizes.push(args.next().unwrap_or_default().parse()?),
+            "--no-whole" => whole_too = false,
             "-h" | "--help" => {
-                eprintln!("usage: ctadl_memory <import>... [--k N] [--max-procs N]...");
+                eprintln!(
+                    "usage: ctadl_memory <import>... [--k N] [--max-procs N]... [--no-whole]"
+                );
                 return Ok(());
             }
             _ => imports.push(a),
@@ -76,7 +84,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for n in sizes.iter().copied() {
         rows.push(one(&n.to_string(), &format!("{n} largest procedures"), &restrict(&whole, n), k));
     }
-    rows.push(one("whole", "whole program", &whole, k));
+    // At a large `k` the whole-program run is the expensive one by orders of
+    // magnitude, and it is not always the one being measured: a `k` sweep wants
+    // a size that converges at every `k`, not the biggest size that fits.
+    if whole_too {
+        rows.push(one("whole", "whole program", &whole, k));
+    }
 
     if rows.len() > 1 {
         println!("\n\n## growth");

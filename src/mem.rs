@@ -395,7 +395,7 @@ macro_rules! idb {
     ($h:expr, $each:ident) => {
         $each![
             $h, sig_target, sig_size, mono_target, eff_direct, critical, known_proc,
-            is_called, uncalled, edge, points, path_used, crit_origin, pending,
+            is_called, uncalled, edge, points, cat, used_ext, crit_origin, pending,
             can_propagate, carries, decisive_var, slot_from_formal, will_propagate, stuck,
             crit_operand, call_crit, load_crit, store_crit, index_crit, decisive_slot,
             crit_sig, free_root, pub_root, pub_points, root_map, blocked, top,

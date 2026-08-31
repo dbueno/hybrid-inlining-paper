@@ -267,36 +267,75 @@ ascent_source! { hybrid_rules:
     points(p.clone(), sup.clone(), PtVal::Path(sub.clone())) <--
         edge(p, sup, sub), if sub.base.is_symbolic();
 
-    /// Suffix congruence, `ω ⊇ ω′ ⟹ ω.a ⊇ ω′.a`, applied on demand: only for
-    /// suffixes some path in `p` actually mentions.
+    /// The access-path bound, restated as concatenation: `cat(α, ρ, α·ρ)` for
+    /// every way an admissible suffix splits, with `ρ` non-empty.
     ///
-    /// "On demand" is not on its own a bound. The observed path `ω.a` may
-    /// itself be one this rule invented, so it feeds its own second premise,
-    /// and a cycle in `edge` then lets it extend paths forever. What keeps
-    /// the path set finite is the last premise of each rule below: the
-    /// extended path must be one the EDB's `paths` admits.
-    relation path_used(Proc, Base, AccessPath);
-    path_used(p.clone(), a.base.clone(), a.clone()) <-- edge(p, a, _);
-    path_used(p.clone(), b.base.clone(), b.clone()) <-- edge(p, _, b);
-    path_used(p.clone(), a.base.clone(), a.clone()) <-- points(p, a, _);
+    /// A tuple exists for `(α, ρ)` exactly when `α·ρ` is admissible, so a rule
+    /// that would test `paths(α·ρ)` after building it can instead *look the
+    /// extension up* — and get back the vocabulary's own `Arc` rather than a
+    /// freshly allocated copy of it.
+    ///
+    /// It is small, and static: one tuple per proper split of each admissible
+    /// suffix, `Σ_{w ∈ paths} |w|`. `paths` is prefix-closed (see
+    /// [`crate::ir::edb`]), so every `α` a split produces is itself
+    /// admissible; nothing here widens the vocabulary.
+    relation cat(Suffix, Suffix, Suffix);
+    cat(pre, rest, w.clone()) <-- paths(w), for (pre, rest) in w.splits();
 
-    edge(p.clone(), sup2.clone(), sub.with_suffix(&ext)) <--
+    /// `used_ext(p, ω, ρ, σ)`: the path with `ω`'s root and suffix `σ` is one
+    /// `p` actually mentions, and `σ` is `ω`'s own suffix followed by a
+    /// non-empty `ρ`.
+    ///
+    /// The observed half of suffix congruence, split the way congruence needs
+    /// to join on it. The prefix `ω` is a *whole path*, so the join below
+    /// keys on `(proc, path)` and every tuple it retrieves is a match. Keying
+    /// on the root instead — which is what a `path_used(p, base, path)`
+    /// forces, a root being a projection of a column and so unindexable —
+    /// hands the rule every path sharing that root and makes it re-derive the
+    /// prefix relation for each one.
+    ///
+    /// `ω` itself need not be observed: congruence's other premise is an
+    /// `edge`, and that is where the prefix comes from.
+    relation used_ext(Proc, AccessPath, Suffix, Suffix);
+    used_ext(p.clone(), a.with_suffix(&pre), rest, a.suffix()) <--
+        edge(p, a, _), for (pre, rest) in a.suffix().splits();
+    used_ext(p.clone(), b.with_suffix(&pre), rest, b.suffix()) <--
+        edge(p, _, b), for (pre, rest) in b.suffix().splits();
+    used_ext(p.clone(), a.with_suffix(&pre), rest, a.suffix()) <--
+        points(p, a, _), for (pre, rest) in a.suffix().splits();
+
+    // Suffix congruence, `ω ⊇ ω′ ⟹ ω.a ⊇ ω′.a`, applied on demand: only for
+    // suffixes some path in `p` actually mentions.
+    //
+    // "On demand" is not on its own a bound. The observed path `ω.a` may
+    // itself be one this rule invented, so it feeds its own second premise,
+    // and a cycle in `edge` then lets it extend paths forever. What keeps
+    // the path set finite is `cat`: the extended path must be one the EDB's
+    // `paths` admits, and only an admissible extension has a tuple to find.
+    //
+    // The shape of the two rules is load-bearing. `used_ext` and `edge`
+    // stand adjacent, both spelled in plain variables, with nothing between
+    // them that mentions a variable of the other: that is what Ascent needs
+    // in order to plan a `[SIMPLE JOIN]`. It then indexes `edge` on
+    // `(proc, sup)` — `(proc, sub)` for the second rule — and picks whichever
+    // of the two relations is smaller as the driver, so neither the delta
+    // nor the total variant ever scans `edge`. Written the other way round,
+    // with the join key a projection and the prefix test an `if let` between
+    // the two clauses, both conditions fail and every iteration scans the
+    // whole of `edge`.
+    edge(p.clone(), sup.with_suffix(&whole), sub.with_suffix(&ext)) <--
+        used_ext(p, sup, rest, whole),
         edge(p, sup, sub),
-        path_used(p, sup.base, sup2),
-        if let Some(rest) = sup2.strip_prefix(sup),
-        if !rest.is_empty(),
-        let ext = sub.suffix().extended(rest),
-        paths(&ext);
+        let sub_suffix = sub.suffix(),
+        cat(sub_suffix, rest, ext);
     // The same congruence triggered from the other side: `ret@build ⊇ v` and
     // an observed `v["old"]` together justify `ret@build["old"] ⊇ v["old"]`,
     // which is how a store through a local reaches the published summary.
-    edge(p.clone(), sup.with_suffix(&ext), sub2.clone()) <--
+    edge(p.clone(), sup.with_suffix(&ext), sub.with_suffix(&whole)) <--
+        used_ext(p, sub, rest, whole),
         edge(p, sup, sub),
-        path_used(p, sub.base, sub2),
-        if let Some(rest) = sub2.strip_prefix(sub),
-        if !rest.is_empty(),
-        let ext = sup.suffix().extended(rest),
-        paths(&ext);
+        let sup_suffix = sup.suffix(),
+        cat(sup_suffix, rest, ext);
 
     // -- pending critical statements: origination and propagation ---------
 

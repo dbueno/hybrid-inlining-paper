@@ -213,8 +213,14 @@ pub struct Suffix(pub Arc<[Accessor]>);
 
 impl Suffix {
     /// The empty suffix, ε — the suffix of a bare root.
+    ///
+    /// One shared allocation for the whole program. `ε` is the prefix of
+    /// every split a depth-1 path has, and depth 1 is where most of a real
+    /// program's paths sit, so [`Suffix::splits`] asks for this often enough
+    /// that handing back an `Arc` beats building an empty one.
     pub fn empty() -> Self {
-        Self::default()
+        static EMPTY: std::sync::OnceLock<Arc<[Accessor]>> = std::sync::OnceLock::new();
+        Self(Arc::clone(EMPTY.get_or_init(|| Vec::new().into())))
     }
 
     /// The accessors, in order.
@@ -246,6 +252,22 @@ impl Suffix {
         accessors.push(a.clone());
         accessors.extend_from_slice(&self.0);
         Self(accessors.into())
+    }
+
+    /// Every way to cut this suffix into a prefix and a *non-empty* rest:
+    /// `.f.g` yields `(ε, .f.g)` and `(.f, .g)`; `ε` yields nothing.
+    ///
+    /// This is the decomposition suffix congruence joins on. Doing it here,
+    /// once per observed path, is what lets the join itself key on a whole
+    /// path rather than on a base — see the `used_ext` relation of
+    /// [`crate::analysis`].
+    pub fn splits(&self) -> impl Iterator<Item = (Suffix, Suffix)> + '_ {
+        (0..self.0.len()).map(|i| match i {
+            // The whole-path split, which every path of depth 1 or more has
+            // and a depth-1 path has only: both halves are already allocated.
+            0 => (Suffix::empty(), self.clone()),
+            _ => (Suffix(self.0[..i].into()), Suffix(self.0[i..].into())),
+        })
     }
 }
 
@@ -372,7 +394,7 @@ impl AccessPath {
         }
     }
 
-    /// This path with `rest` appended, used by suffix congruence.
+    /// This path with `rest` appended.
     pub fn extend(&self, rest: &[Accessor]) -> Self {
         let mut accessors = self.accessors.to_vec();
         accessors.extend_from_slice(rest);
@@ -383,6 +405,10 @@ impl AccessPath {
     }
 
     /// If `self` is `prefix` followed by more accessors, the extra accessors.
+    ///
+    /// Suffix congruence used to test this pair by pair; it now joins on
+    /// [`Suffix::splits`] instead, which decides the same relation once per
+    /// observed path. See the `used_ext` relation of [`crate::analysis`].
     /// `ω.f.g`.strip_prefix(`ω`) is `[.f, .g]`; unrelated paths give `None`.
     pub fn strip_prefix(&self, prefix: &AccessPath) -> Option<&[Accessor]> {
         if self.base != prefix.base || self.accessors.len() < prefix.accessors.len() {

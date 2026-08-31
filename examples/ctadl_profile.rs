@@ -18,8 +18,9 @@
 use std::time::Duration;
 
 use hybrid_inlining_paper::analysis::profile::ProfiledHybridAnalysis;
-use hybrid_inlining_paper::access_path::{AccessPath, Base};
+use hybrid_inlining_paper::access_path::AccessPath;
 use hybrid_inlining_paper::ctadl::{Options, Translator, read_import, restrict};
+use hybrid_inlining_paper::ir::Proc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut imports: Vec<String> = Vec::new();
@@ -85,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== relation sizes ===\n{}", a.relation_sizes_summary());
 
     // Suffix congruence materializes a *longer* path from every pair it
-    // matches, and the longer path is itself a `path_used` entry that can
+    // matches, and the longer path is itself a `used_ext` entry that can
     // match again. If that is what is running away, it shows up here as a
     // long tail: paths far deeper than any the front end wrote down.
     println!("=== access-path depth in `edge` ===");
@@ -190,20 +191,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         100.0 * repeated as f64 / distinct.len() as f64
     );
 
-    // 3. The join fan-out. Both congruence rules join `edge` against
-    //    `path_used` on `(proc, base)`, so the work per edge tuple is the
-    //    number of paths sharing that base. This is the multiplier that turns
-    //    a large `edge` into a quadratic scan.
-    let mut per_base: std::collections::HashMap<&Base, usize> = Default::default();
-    for (_, b, _) in &a.path_used {
-        *per_base.entry(b).or_default() += 1;
+    // 3. The join fan-out. Both congruence rules join `used_ext` against
+    //    `edge` on `(proc, path)`, so the work is one retrieval per `used_ext`
+    //    tuple and the multiplier is the number of edges hanging off that
+    //    exact path — not, as it was when the key was `(proc, base)`, the
+    //    number of paths sharing a root.
+    let mut per_sup: std::collections::HashMap<(&Proc, &AccessPath), usize> = Default::default();
+    let mut per_sub: std::collections::HashMap<(&Proc, &AccessPath), usize> = Default::default();
+    for (p, sup, sub) in &a.edge {
+        *per_sup.entry((p, sup)).or_default() += 1;
+        *per_sub.entry((p, sub)).or_default() += 1;
     }
-    let mut fan: Vec<usize> = per_base.values().copied().collect();
+    let mut fan: Vec<usize> = Vec::with_capacity(a.used_ext.len());
+    for (p, w, _, _) in &a.used_ext {
+        fan.push(per_sup.get(&(p, w)).copied().unwrap_or(0));
+        fan.push(per_sub.get(&(p, w)).copied().unwrap_or(0));
+    }
     fan.sort_unstable();
     let sum: usize = fan.iter().sum();
     let pick = |q: f64| fan.get(((fan.len() as f64 - 1.0) * q) as usize).copied().unwrap_or(0);
     println!(
-        "  paths per base: n={} mean={:.0} p50={} p99={} max={}",
+        "  edges per (proc, path) retrieved: n={} mean={:.1} p50={} p99={} max={}",
         fan.len(),
         sum as f64 / fan.len().max(1) as f64,
         pick(0.50),
@@ -211,9 +219,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fan.last().copied().unwrap_or(0)
     );
     println!(
-        "  => congruence scans ~{} edges x ~{:.0} paths/base per iteration",
-        a.edge.len(),
-        sum as f64 / fan.len().max(1) as f64
+        "  => congruence considers ~{} (edge, extension) pairs per full pass, from {} \
+         indexed lookups; before the join was indexed it rescanned all {} edges every \
+         iteration instead",
+        sum,
+        fan.len(),
+        a.edge.len()
     );
 
     Ok(())

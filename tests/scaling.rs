@@ -77,7 +77,11 @@ fn figure1_relation_sizes_are_stable() {
     for (rel, want) in [
         ("edge", 40),
         ("points", 53),
-        ("path_used", 65),
+        // Figure 1 has no field or index accessor anywhere, so its access-path
+        // vocabulary is `{ε}` and there is nothing for suffix congruence to
+        // extend: the observed-extension table stays empty. Non-zero here
+        // would mean congruence had invented an accessor.
+        ("used_ext", 0),
         ("pending", 4),
         ("pub_edge", 16),
         ("pub_points", 5),
@@ -96,7 +100,10 @@ fn figure1_relation_sizes_are_stable() {
 fn a_linear_call_chain_costs_a_constant_per_level() {
     let pts: Vec<(Program, usize)> =
         [4usize, 8, 16, 32].iter().map(|&n| (chain(n, 2), n + 2)).collect();
-    for rel in ["edge", "points", "pending", "pub_edge", "root_map", "path_used"] {
+    // `used_ext` is not in the list: the family is field-free, so it is empty
+    // at every size. Suffix congruence's growth is pinned by
+    // `suffix_congruence_is_quadratic_within_a_procedure`, on `fields`.
+    for rel in ["edge", "points", "pending", "pub_edge", "root_map"] {
         let d = fit(rel, &pts);
         assert!(d < 1.35, "chain: {rel} grows as |P|^{d:.2}, expected ~linear");
     }
@@ -149,7 +156,7 @@ fn points_is_quadratic_in_a_single_procedure() {
 #[test]
 fn suffix_congruence_is_quadratic_within_a_procedure() {
     let pts: Vec<(Program, usize)> = [4usize, 8, 16, 32].iter().map(|&n| (fields(n), 0)).collect();
-    for rel in ["edge", "points", "path_used"] {
+    for rel in ["edge", "points", "used_ext"] {
         let d = fit(rel, &pts);
         assert!(d > 1.5, "fields: {rel} grows as |P|^{d:.2}, expected ~quadratic");
     }
@@ -163,7 +170,8 @@ fn suffix_congruence_is_quadratic_within_a_procedure() {
 fn many_procedures_cost_a_constant_each_when_nothing_is_critical() {
     let pts: Vec<(Program, usize)> =
         [8usize, 16, 32, 64].iter().map(|&m| (wide(m, 8), 0)).collect();
-    for rel in ["edge", "points", "path_used", "pub_edge", "pub_points", "root_map"] {
+    // Field-free again, so no `used_ext` — see the note in the chain test.
+    for rel in ["edge", "points", "pub_edge", "pub_points", "root_map"] {
         let d = fit(rel, &pts);
         assert!(d < 1.15, "wide: {rel} grows as |P|^{d:.2}, expected ~linear in m");
     }

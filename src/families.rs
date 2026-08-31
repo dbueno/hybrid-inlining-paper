@@ -276,7 +276,7 @@ pub fn alias(n: usize) -> Program {
 }
 
 /// A chain of `n` *distinct* field loads off a parameter, all inside one
-/// procedure: stresses the suffix-congruence rules and `path_used`. Distinct
+/// procedure: stresses the suffix-congruence rules and `used_ext`. Distinct
 /// fields, because repeating one would let congruence extend a path by a
 /// suffix it already carries and grow it without bound.
 pub fn fields(n: usize) -> Program {

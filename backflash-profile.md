@@ -16,7 +16,7 @@ cargo run --features ctadl,profile --release --example ctadl_profile -- \
 
 2.5s, and it prints everything this document is drawn from: the EDB shape,
 whether the fixpoint converged, per-SCC and per-rule times, **the size of every
-relation in the program — all 64 of them, EDB and IDB alike** — and the
+relation in the program — all 65 of them, EDB and IDB alike** — and the
 access-path depth histogram. The sizes are their own section of the output:
 
 ```sh
@@ -28,13 +28,14 @@ cargo run --features ctadl,profile --release --example ctadl_profile -- \
 ```
 points size: 1061910          <-- the largest thing in the run
 edge size: 245047
-path_used size: 76332
+used_ext size: 57192
 pub_points size: 41587
 in_proc size: 29166           <-- the input
 root_map size: 22325
 actual_arg size: 14858
 pub_root size: 10476
 ...
+cat size: 933                 <-- the bound, as a lookup
 paths size: 741               <-- the bound itself
 ```
 
@@ -50,7 +51,7 @@ end.
 the `paths` relation of `src/ir.rs` — the syntactic bound on the access-path
 vocabulary computed by `src/path_bound.rs` and tested against by every rule
 that lengthens a path. Without such a bound the fixpoint does not exist on this
-program: suffix congruence feeds itself through `path_used`, cycles in `edge`
+program: suffix congruence feeds itself through `used_ext`, cycles in `edge`
 make the closure infinite, and the clock is the only thing that stops it.
 `src/path_bound.rs` sets out the argument. This document measures what the
 analysis does on the app now that the bound is in place.
@@ -84,24 +85,26 @@ critical statements, in 1034 pending instances at `k = 1`.
 
 ```
 procs=2375 stmts=29166 virtual_call=5526 direct_call=2477 k=1
-converged=true wall=2.52s
+converged=true wall=1.98s
 ```
 
-Peak physical footprint is 1.49 GiB, from `/usr/bin/time -l` on a second run.
-It was 1.55 GiB before `pub_edge` was de-tabulated.
+Peak physical footprint is 1.37 GiB, from `/usr/bin/time -l`, and both figures
+are the median of three back-to-back runs that agree to 0.5%. The lineage: 3.11s
+and 1.55 GiB before `pub_edge` was de-tabulated, 2.53s and 1.43 GiB after, 1.98s
+and 1.37 GiB now that the congruence join is indexed.
 Everything from here to "How it grows with k" is at `k = 1`.
 
 ## `pub_edge` is no longer a relation
 
-Every number in this document was re-measured after the first item of "What is
-left to try" was done. `pub_edge` — `points` filtered by `pub_root` on both
-endpoints — is gone; its two consumers drive on `points` directly, and neither
-had to re-state the filter, because at a static callsite `root_map`'s second
-column already holds only symbolic roots of the callee, and at a resolved
-critical statement `crit_subst` is already undefined on a local. The set itself
-is recomputed once after convergence, by `HybridAnalysis::pub_edges()`, for the
-reporting layer. `src/analysis.rs` states the argument where the rule used to
-be.
+The first item of "What is left to try" as it then stood, and the change the
+next section's `before` column is measured against. `pub_edge` — `points`
+filtered by `pub_root` on both endpoints — is gone; its two consumers drive on
+`points` directly, and neither had to re-state the filter, because at a static
+callsite `root_map`'s second column already holds only symbolic roots of the
+callee, and at a resolved critical statement `crit_subst` is already undefined
+on a local. The set itself is recomputed once after convergence, by
+`HybridAnalysis::pub_edges()`, for the reporting layer. `src/analysis.rs`
+states the argument where the rule used to be.
 
 Two binaries, the previous commit's and this one's, same machine, same import,
 `/usr/bin/time -l`, back to back:
@@ -130,6 +133,108 @@ things worth knowing before repeating the move somewhere else:
   four of the five then re-scan `points` in full on every iteration. A
   de-tabulation only pays when the filter is discharged by something the rule
   already joins against.
+
+## The congruence join is indexed
+
+The third item of "What is left to try" is done, and this section is what it
+cost and bought. Everything above and below was re-measured after it.
+
+Suffix congruence used to be written the way the rule reads:
+
+```rust
+edge(p, sup2, sub.with_suffix(&ext)) <--
+    edge(p, sup, sub),
+    path_used(p, sup.base, sup2),
+    if let Some(rest) = sup2.strip_prefix(sup), …
+```
+
+and the profile said `edge_indices_none_total`: a full scan of `edge`, every
+iteration, in both of the variants where `path_used` is the delta. Two separate
+things in Ascent's planner cause that, and the obvious fix addresses only one
+of them.
+
+- **The join key was a projection.** `sup.base` is not a column, so no index on
+  `edge` can be derived from it. Ascent indexes `path_used` on `(proc, base)`
+  perfectly well — it is the *other* side that has nothing to look up by, and
+  atoms are compiled in source order, so `edge` stays the outer loop.
+- **The `if let` sat between the two atoms.** Ascent will swap the first two
+  body clauses (and pick the smaller as the driver) only for a `[SIMPLE JOIN]`:
+  two adjacent clauses of plain variables, with no condition on the second that
+  mentions a variable of the first. `strip_prefix(sup)` mentions one. Giving
+  `edge` a `Base` column would have fixed the first problem and left this one,
+  and would still have been keyed on a root.
+
+So the split moved out of the rule and into a relation. `used_ext(p, ω, ρ, σ)`
+records that `p` mentions a path whose suffix is `σ = suffix(ω)·ρ` — the prefix
+decomposition done once per observed path instead of once per candidate pair —
+and `cat(α, ρ, α·ρ)` is `paths` restated as concatenation, 933 tuples, so the
+admissibility test becomes a lookup that returns the vocabulary's own `Arc`.
+Congruence is then three atoms, no conditions, and the join key is a whole
+path:
+
+```rust
+edge(p, sup.with_suffix(&whole), sub.with_suffix(&ext)) <--
+    used_ext(p, sup, rest, whole),
+    edge(p, sup, sub),
+    let sub_suffix = sub.suffix(),
+    cat(sub_suffix, rest, ext);
+```
+
+The plan the profile now prints, for all four variants:
+
+```
+edge <-- used_ext_indices_0_1_delta, edge_indices_0_1_total+delta, ⋯, cat_indices_0_1_total [SIMPLE JOIN]
+edge <-- used_ext_indices_0_1_total, edge_indices_0_1_delta,       ⋯, cat_indices_0_1_total [SIMPLE JOIN]
+edge <-- used_ext_indices_0_1_delta, edge_indices_0_2_total+delta, ⋯, cat_indices_0_1_total [SIMPLE JOIN]
+edge <-- used_ext_indices_0_1_total, edge_indices_0_2_delta,       ⋯, cat_indices_0_1_total [SIMPLE JOIN]
+```
+
+Same three sizes as the `pub_edge` table, same machine, same import,
+`/usr/bin/time -l`, three runs each at the first two sizes and two at the
+third. Wall clock repeats to within 0.5%, so one figure is quoted; the peak
+does not, so its *lowest* observation is quoted on both sides, which is the
+reading least flattering to the change:
+
+```
+                            before          after
+  whole program, k=1     2.53s  1.42 GiB    1.98s  1.37 GiB
+  whole program, k=2    15.26s  5.41 GiB   11.04s  5.10 GiB
+  80 procedures, k=8    61.06s 18.01 GiB   42.89s 16.72 GiB
+```
+
+`/usr/bin/time -l` also counts instructions: 28.2G before, 20.7G after, on the
+`k = 1` run. A quarter of the work is simply gone.
+
+Three things worth knowing before repeating the move somewhere else.
+
+- **The derivation is unchanged, and that was checked rather than assumed.**
+  Pre-change and post-change binaries, relation sizes diffed on this app at
+  `k = 1`, `k = 2` and (at 80 procedures) `k = 8`: all 63 relations the two
+  versions share agree exactly, tuple count for tuple count, with only
+  `path_used` missing and `used_ext`/`cat` new. The 80-procedure `k` sweep says
+  it at eight points rather than one — `points`, `edge`, `pub_points` and
+  `pub_root` are identical at every `k` from 1 to 8. The access-path depth
+  histogram is identical too.
+
+- **The observed-path table did not get more expensive, but only after one
+  allocation was removed.** `used_ext` is a *replacement* for `path_used`, not
+  an addition — 57,192 tuples against 76,332, because it drops the depth-0
+  paths that can extend nothing. The first version of it nonetheless cost 213ms
+  against `path_used`'s 165ms, all of it in `Suffix::splits` allocating both
+  halves of every split. 82% of the paths here have depth 1, whose only split
+  is `(ε, whole)` — two halves that already exist. Handing back a shared `ε`
+  and an `Arc::clone` of the path's own suffix put it back to 165ms.
+
+- **Allocation count fell by more than anything else.** `cat` returns a
+  suffix out of the vocabulary instead of building one, and `splits` hands back
+  `Arc`s it already has, so the run makes **869,983 allocations against
+  4,635,107** — 5.3× fewer — and the `Arc` payload the fixpoint builds falls
+  from 4.9 MiB to 1.3 MiB. Accounted bytes barely move, since the tuple `Vec`s
+  are the same size. The process footprint does move, and it stops varying
+  between runs: at 80 procedures and `k = 8` the two `before` runs read 18.01
+  and 19.30 GiB, the two `after` runs 16.72 and 16.75. Allocator churn is the
+  obvious explanation and is consistent with every reading here, but it was not
+  isolated — nothing below rests on it.
 
 ## The vocabulary, and what it does to the paths
 
@@ -170,69 +275,82 @@ The cycles that would generate those are still there:
 They simply no longer produce anything new. The bound does not remove the
 cycles, it removes their range.
 
-The congruence join's fan-out — the number of paths sharing a base, which is
-the multiplier on every scan of `edge` — is correspondingly small:
+The congruence join's fan-out is correspondingly small. It is now measured
+the way the indexed join actually works — one lookup per `used_ext` tuple,
+retrieving the edges hanging off that exact path:
 
 ```
-  paths per base: n=24145  mean=3  p50=1  p99=44  max=49
+  edges per (proc, path) retrieved: n=114384 mean=11.8 p50=1 p99=173 max=231
+  => congruence considers ~1347479 (edge, extension) pairs per full pass,
+     from 114384 indexed lookups; before the join was indexed it rescanned
+     all 245047 edges every iteration instead
 ```
+
+The median lookup returns one edge. The mean is 11.8 because a few symbolic
+roots carry hundreds — but those are retrievals of tuples the rule will use,
+not candidates it will reject, which is the difference the key made.
 
 ## Where the time goes
 
 One SCC dominates: stratum B, the big mutually-recursive block.
 
 ```
-scc 45: iterations: 42, time: 2.452s   (sum of rule times 1.934s)
-the other 49 SCCs: 48ms between them
+scc 46: iterations: 42, time: 1.921s   (sum of rule times 1.502s)
+the other 50 SCCs: 47ms between them
 ```
 
-Inside it there are 86 rules, of which ten are 92% of the time:
+Inside it there are 86 rules, of which ten are 90% of the time:
 
 ```
      ms      %  rule
-  620.9  32.1%  points    <-- edge_total, points_delta               [SIMPLE JOIN]
-  274.7  14.2%  edge      <-- edge_total, path_used_delta, ⋯, paths  (congruence, sup side)
-  261.5  13.5%  edge      <-- edge_total, path_used_delta, ⋯, paths  (congruence, sub side)
-  193.4  10.0%  edge      <-- eff_direct, in_proc, points_delta, root_map, root_map
-   99.1   5.1%  points    <-- edge_delta, points_total               [SIMPLE JOIN]
-   93.0   4.8%  path_used <-- points_delta
-   76.6   4.0%  points    <-- edge_delta
-   74.0   3.8%  edge      <-- edge_delta, path_used, ⋯, paths        (congruence, delta)
-   55.0   2.8%  edge      <-- edge_delta, path_used, ⋯, paths        (congruence, delta)
-   39.6   2.0%  path_used <-- edge_delta
+  641.8  42.7%  points    <-- edge_0_2_total, points_0_1_delta          [SIMPLE JOIN]
+  192.6  12.8%  edge      <-- eff_direct, in_proc, points_delta, root_map, root_map
+  106.4   7.1%  points    <-- edge_0_2_delta, points_0_1_total          [SIMPLE JOIN]
+   97.9   6.5%  used_ext  <-- points_delta, for_
+   79.7   5.3%  points    <-- edge_delta
+   77.2   5.1%  edge      <-- used_ext_delta, edge_0_2, ⋯, cat  (congruence, sub side)
+   68.4   4.6%  edge      <-- used_ext_delta, edge_0_1, ⋯, cat  (congruence, sup side)
+   37.5   2.5%  used_ext  <-- edge_delta, for_
+   31.0   2.1%  used_ext  <-- edge_delta, for_
+   26.6   1.8%  points    <-- eff_direct, in_proc, pub_points_delta, root_map
 ```
 
-By group, out of 1.934s of rule time:
+By group, out of 1.502s of rule time:
 
 ```
-  points, the alias closure                        829ms   43%
-  suffix congruence (four variants)                665ms   34%
-  inlining at a static callsite (three variants)   211ms   11%
-  path_used                                        164ms    8%
-  inlining at a resolved critical statement          9ms    0%
+  points, the alias closure                        828ms   55%
+  inlining at a static callsite (three variants)   242ms   16%
+  used_ext, the observed-path table                166ms   11%
+  suffix congruence (four variants)                161ms   11%
+  inlining at a resolved critical statement         10ms    1%
+  cat, built once from `paths`                     0.3ms    0%
 ```
 
-The publication rule that used to sit second at 350ms is gone with the
-relation, and the callsite rule that consumed it now drives on `points`
-instead, for 211ms against the 185ms it cost before — the whole of the old
-`pub_edge` line, minus 26ms.
+Against the same table before the join was indexed — `points` 816ms/41%,
+congruence **664ms/33%**, callsite 250ms/13%, `path_used` 165ms/8%. Congruence
+fell 4.1×, from the second-largest group to the fourth, and nothing else moved:
+`points`, the callsite rules and the observed-path table are all within 2% of
+what they cost before, so the 497ms the run lost is the scan and nothing else.
 
-One thing the profile still says out loud: congruence's plan is
-`edge_indices_none_total`, a full scan. Ascent indexes on whole columns and
-this join keys on `sup.base`, a *projection of* column 1, so it cannot be
-planned as a `[SIMPLE JOIN]`. With the fan-out down to 3 that costs 665ms
-rather than being fatal, but it is now the largest thing in the SCC after
-`points` itself, and the most obvious speedup available.
+Two rules are missing from the table that earlier versions of this document
+had near the top: the publication rule, at 350ms, which went with `pub_edge`,
+and the callsite rule that consumed it, which now drives on `points` for
+242ms.
+
+Congruence is no longer where to look. `points` is now 55% of rule time on its
+own, and its two big variants are already `[SIMPLE JOIN]`s on whole columns —
+there is no plan left to fix there, only the quadratic itself.
 
 Relation sizes at the fixpoint:
 
 ```
 points     1,061,910      <-- the largest thing in the run
 edge         245,047      (8.4x the input)
-path_used     76,332
+used_ext      57,192
 pub_points    41,587
 root_map      22,325
 pub_root      10,476
+cat              933      (the bound, as a lookup)
 paths            741      (the bound itself)
 in_proc       29,166      (the input)
 ```
@@ -241,29 +359,31 @@ in_proc       29,166      (the input)
 
 ```
 ## whole program — 2375 procedures, 29166 statements
-  |P| = 90092 EDB facts;  retained 1.5 GiB, peak 1.5 GiB, 4,635,107 allocations
+  |P| = 90092 EDB facts;  retained 1.4 GiB, peak 1.5 GiB, 869,983 allocations
 
   relation      tuples   Vec bytes   B/tuple
   points     1,061,910    288.0 MiB    284.4
   edge         245,047     36.0 MiB    154.0
-  path_used     76,332     16.0 MiB    219.8
   pub_points    41,587      9.0 MiB    226.9
+  used_ext      57,192      7.0 MiB    128.3
   root_map      22,325      3.5 MiB    164.4
   pub_root      10,476      1.0 MiB    100.1
-  -- total   1,511,851    356.3 MiB    247.1
+  cat              933     48.0 KiB     52.7
+  -- total   1,493,644    347.3 MiB    243.8
 
   where `retained` went
-    tuple Vecs      356.3 MiB   24%
-    Arc payloads      4.9 MiB    0%   suffixes and call strings the fixpoint built
+    tuple Vecs      347.3 MiB   24%
+    Arc payloads      1.3 MiB    0%   suffixes and call strings the fixpoint built
     Ascent indices    1.1 GiB   76%   by subtraction
 ```
 
 Three things worth keeping:
 
-- **The suffixes cost nothing.** 4.9 MiB of `Arc` payload against 1.5 GiB
-  retained. A vocabulary of 741 suffixes means every access path in the run
-  shares one of 741 allocations, so the part of memory that grows with path
-  depth does not register at all.
+- **The suffixes cost nothing.** 1.3 MiB of `Arc` payload against 1.4 GiB
+  retained — it was 4.9 MiB before `cat` started handing extensions back out
+  of the vocabulary instead of building them. A vocabulary of 741 suffixes
+  means every access path in the run shares one of 741 allocations, so the
+  part of memory that grows with path depth does not register at all.
 
 - **76% of the memory is Ascent's indices**, not tuples. That is the thing to
   attack if 1.5 GiB is too much: it is decided by which columns the rules join
@@ -285,10 +405,10 @@ Three things worth keeping:
 ```
   procs                100         400        1000       whole
   |P|                45457       64867       77084       90092
-  tuples            345007      698933      904522     1511851
-  retained       267.6 MiB   570.2 MiB   855.4 MiB     1.5 GiB
-  peak           305.2 MiB   623.3 MiB   918.6 MiB     1.5 GiB
-  B/tuple            813.4       855.5       991.6      1036.1
+  tuples            344610      695631      896040     1493644
+  retained       264.5 MiB   562.6 MiB   838.7 MiB     1.4 GiB
+  peak           302.0 MiB   615.6 MiB   901.5 MiB     1.5 GiB
+  B/tuple            804.9       848.1       981.5      1028.3
 ```
 
 Doubling `|P|` costs about 4.3× the tuples and 5.6× the bytes — `tuples ~
@@ -316,8 +436,8 @@ reach one, which means shrinking the program until they exist.
 ```
   k                    1           2            4            5            6            7      8
   outcome      converged   converged      timeout      timeout      timeout      timeout killed
-  wall              2.5s       15.2s         246s         259s         762s         391s     —
-  peak GiB          1.49        5.98        43.97        40.37        42.73        59.39    >64
+  wall              2.0s       11.0s         246s         259s         762s         391s     —
+  peak GiB          1.37        5.22        43.97        40.37        42.73        59.39    >64
   iterations          42          42           50           19           17           15     —
   pending          1,034       2,183       14,042       41,273      159,491      710,364     —
   points       1,061,910   3,550,302   32,021,999   26,381,136   21,652,385   43,490,363     —
@@ -339,6 +459,13 @@ column as "where the budget got to" and nothing more. `k = 8` has no column at
 all: `memguard.sh` killed it at 64.4 GiB, and the kill takes the process before
 it prints, so a capped run yields no relation sizes.
 
+Only the `k = 1` and `k = 2` columns are current. Their sizes are unchanged by
+the congruence index — that was checked — and their `wall` and `peak` rows are
+re-measured. The `k >= 4` columns predate it and were not re-run: they measure
+where a 240s budget got to, so re-running them would produce different numbers
+whether or not anything had changed, which is the whole point of the paragraph
+above.
+
 ### At 80 procedures, every `k` converges
 
 80 procedures is where the earlier sweep found the ceiling — the largest
@@ -352,29 +479,40 @@ before — and the numbers are comparable:
 ```
   k                  1         2         3         4         5         6         7         8
   tuples          333K      774K     1.76M     3.49M     6.09M     9.55M     13.9M     19.2M
-  retained     265 MiB   649 MiB   1.4 GiB   2.8 GiB   4.8 GiB   9.0 GiB   9.9 GiB  18.0 GiB
-  peak         300 MiB   792 MiB   1.8 GiB   3.5 GiB   5.5 GiB  10.1 GiB  11.2 GiB  19.3 GiB
-  index share      79%       81%       79%       79%       75%       74%       76%       74%
-  Arc          1.5 MiB   2.6 MiB   3.3 MiB   5.7 MiB  19.5 MiB  46.9 MiB  95.1 MiB 162.6 MiB
+  retained     262 MiB   644 MiB   1.4 GiB   2.8 GiB   4.8 GiB   9.0 GiB   9.9 GiB  18.0 GiB
+  peak         296 MiB   788 MiB   1.8 GiB   3.5 GiB   5.5 GiB  10.1 GiB  11.2 GiB  19.3 GiB
+  index share      79%       82%       79%       79%       75%       74%       76%       74%
+  Arc          0.4 MiB   0.4 MiB   0.8 MiB   2.8 MiB  16.2 MiB  43.2 MiB  90.6 MiB 156.3 MiB
 
   points       218,292   460,702   974,566 1,863,132 3,190,922 4,942,324 7,151,120 9,804,384
   edge          57,499   231,299   660,520 1,450,878 2,670,490 4,316,730 6,414,674 8,957,736
   pub_points     8,986    26,465    57,444    99,313   145,050   190,839   236,858   283,031
+  used_ext      20,615    26,711    34,366    43,143    52,492    62,557    74,594    90,035
   pub_root         635       812     1,050     1,341     1,703     2,186     2,932     4,183
 ```
 
-`points`, `edge` and `pub_root` are identical to the pre-de-tabulation column
-for column at every `k` — that is the check that the derivation did not change,
-run at the size where the two differ most. What moved is `tuples` (−33% at
-`k = 8`, all of it the missing relation) and, following it, `retained` (−20%)
-and `peak` (−23%).
+`points`, `edge`, `pub_points` and `pub_root` are identical column for column
+at every `k`, both to the pre-de-tabulation sweep and to the pre-index one —
+that is the check that neither change altered the derivation, run at the size
+where the alternatives differ most. `pub_edge` took `tuples` down 33% when it
+went; indexing the congruence join left `tuples` and `retained` essentially
+untouched, which is the honest summary of it: **it is a time change, not a
+space one.** `Arc` payloads are the exception, down 4-8× at every `k` because
+`cat` returns interned suffixes; and the *process* footprint at `k = 8` is
+16.7 GiB against 18.0-19.3 GiB, which this accounting cannot see and which the
+5× drop in allocation count is the likely but unisolated cause of.
 
 **The growth is polynomial in `k`, not exponential.** Fitting `k = 3..8`:
 
 ```
   tuples ~ k^2.45    points ~ k^2.36    edge ~ k^2.66    pub_points ~ k^1.62
-  retained ~ k^2.53  pub_root ~ k^1.36  Arc ~ k^4.20
+  retained ~ k^2.53  pub_root ~ k^1.36  used_ext ~ k^0.97  Arc ~ k^5.61
 ```
+
+Every exponent but `Arc`'s is what it was before the congruence index, which
+follows from the relations being identical. `Arc`'s got steeper only because
+its base got smaller: 0.8 MiB at `k = 3` instead of 3.3, against 156 MiB at
+`k = 8` instead of 163.
 
 The call-string space *is* exponential in `k` in principle — that is what
 `tests/scaling.rs::call_strings_double_per_level_unless_k_caps_them` pins down —
@@ -397,7 +535,7 @@ Everything else — `root_map` flat at ~11K, `eff_direct`, `mono_target`,
 ```
   k                  1     2     3     4     5     6     7     8
   edge/points      .26   .50   .68   .78   .84   .87   .90   .91
-  (points+edge)/all .83  .89   .93   .95   .96   .97   .98   .98
+  (points+edge)/all .83  .89   .93   .95   .96   .97   .97   .98
 ```
 
 The relation this table used to have a third row for was `pub_edge`, whose
@@ -410,9 +548,10 @@ still means that raising `k` makes every published summary bigger, in the
 caller as much as the callee; it just no longer costs a second table to find
 that out.
 
-`Arc` payloads are the one component outpacing the closure (`k^4.20` — the call
-strings themselves getting longer and more numerous), but at 163 MiB of 18.0 GiB
-they are still 0.9% of the bill. Worth watching, not worth fixing.
+`Arc` payloads are the one component outpacing the closure (`k^5.61` — the call
+strings themselves getting longer and more numerous; the suffixes are interned
+and contribute nothing), but at 156 MiB of 18.0 GiB they are still 0.8% of the
+bill. Worth watching, not worth fixing.
 
 The access-path bound is untouched by any of this: `paths` stays 741 by
 construction and the depth histogram tops out at 4 accessors at every `k`, on
@@ -428,7 +567,7 @@ In the order the numbers argue for:
    and `k = 8`, with the derivation unchanged. Everything below is measured
    after it.
 
-2. **Shrink the index footprint** — now 74-81% of retained at *every* `k`, so
+2. **Shrink the index footprint** — still 74-82% of retained at *every* `k`, so
    this is a flat 4-5× multiplier on everything above rather than something
    that gets worse. It is the largest absolute lever left, and it is unrelated
    to `k`. Fewer binding patterns over `points` is the lever; note that item 1
@@ -436,12 +575,13 @@ In the order the numbers argue for:
    cheap index set while adding an index on `points` that the two inlining
    rules now need.
 
-3. **Index the congruence join.** `edge_indices_none_total` is a full scan and,
-   with the publication rule gone, the largest thing in the SCC after `points`
-   itself (665ms of 1.93s at `k = 1`, 34%). Give `edge` its bases as real
-   columns (`edge(Proc, Base, AccessPath, Base, AccessPath)`, or a companion
-   relation) so Ascent can plan `[SIMPLE JOIN]` on `(p, base)`. This is now the
-   clearest single speedup on the list.
+3. ~~**Index the congruence join.**~~ Done — see "The congruence join is
+   indexed" above. Congruence went 664ms → 161ms at `k = 1` and the whole run
+   −22% wall, −28% at `k = 2`, −30% at 80 procedures and `k = 8`, with the
+   derivation unchanged at all three. Not by giving `edge` `Base` columns,
+   which would have keyed on a root and left the `if let` in the way, but by
+   splitting the observed path in a relation so the key is the whole path.
+   Everything above is measured after it.
 
 4. **Make the publication filter filter again.** `pub_root` is what decides how
    much of `points` becomes summary, and it grows as `k^1.36` against `points`
@@ -584,7 +724,19 @@ short, only decline to start another, so a truncated run can take several times
 the budget — `k = 6` above took 762s of an asked-for 240s.
 
 Finally, if what you are measuring is a *rule* edit rather than the app, build
-the previous commit in a second worktree and diff the two relation-size lists
+the binary *before* editing, keep it, and diff the two relation-size lists
 before believing any timing. That is what established that removing `pub_edge`
-left the other 64 relations tuple-for-tuple identical; a sweep that only gets
-faster and smaller looks exactly the same as one that quietly derives less.
+left the other 64 relations tuple-for-tuple identical, and that indexing the
+congruence join left the 63 it shares with its predecessor identical at `k = 1`,
+`k = 2` and — relation by relation, at every `k` from 1 to 8 — on the
+80-procedure cut. A sweep that only gets faster and smaller looks exactly the
+same as one that quietly derives less.
+
+Two practical notes on doing that. The comparison binary does not need a second
+worktree: build it from the clean tree first and copy it aside
+(`cp target/release/examples/ctadl_profile …/ctadl_profile_before`), which
+avoids a second 30 GiB `target` on a machine that may not have room for one.
+And read the diff by relation *name* as well as by size — a change that renames
+or replaces a relation, as this one did, produces a list of a different length,
+and a comparison that only checks shared rows will silently skip whatever went
+missing.

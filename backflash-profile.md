@@ -1,350 +1,111 @@
-# Why the analysis does not finish on backflash.apk
+# backflash.apk under the access-path bound
 
-> **Resolved.** Hypothesis 1 below was right, and the fix is the `paths`
-> relation of `src/ir.rs` — a syntactic bound on the access-path vocabulary,
-> computed by `src/path_bound.rs` and tested against by every rule that
-> lengthens a path. Under it this same input converges in **3.6 s** with
-> `edge` at 245,047 tuples, and the single-procedure case below in **21 ms**.
-> The vocabulary of the whole program is 741 suffixes, four accessors deep at
-> the most. Everything from here to "[After the bound](#after-the-bound)"
-> describes the analysis *before* that bound, and is kept as the measurement
-> that motivated it; that last section is where it stands now.
+## Running it, in one command
 
-`backflash.apk` is a TaintBench Android app. CTADL imports it in a fraction of
-a second and the translation into our EDB is instant. The analysis then runs
-forever. This is what it is doing.
-
-Everything below was measured with `examples/ctadl_profile.rs`, which runs
-`analysis::profile::ProfiledHybridAnalysis` — the same rules as
-`HybridAnalysis`, from the same `hybrid_rules` source, under Ascent's
-`#![measure_rule_times]` and `#![generate_run_timeout]`. The timeout is what
-makes any of this observable: the fixpoint never converges, and `run_timeout`
-stops between iterations with every rule's timer already filled in.
+The input is a *name* in CTADL's import store, not a path in this repo:
+`read_import` resolves `backflash.apk` to
+`$XDG_STATE_HOME/ctadl/imports/backflash.apk` (`~/.local/state/ctadl/...`),
+which holds `ir-program.bitcode` and `ir-vmt.bitcode`. If that directory is
+not there, make it from the TaintBench APK — `ctadl import backflash.apk`
+names an import after the file by default — and then, from this directory:
 
 ```sh
 cargo run --features ctadl,profile --release --example ctadl_profile -- \
     backflash.apk --k 1 --timeout 120
 ```
 
-## The short version
+3.2s, and it prints everything this document is drawn from: the EDB shape,
+whether the fixpoint converged, per-SCC and per-rule times, **the size of every
+relation in the program — all 66 of them, EDB and IDB alike** — and the
+access-path depth histogram. The sizes are their own section of the output:
 
-The analysis has **no bound on how long an access path may get**. Suffix
-congruence keeps extending paths, and a cycle among the constraints of a
-single procedure lets it extend them without limit. On backflash it builds
-paths like `x.wl.wl.wl.wl.length[]` — the same field repeated four times, which
-no heap object can satisfy — and 85% of all the paths it invents are of that
-kind. There is no fixpoint to reach. The clock is the only thing that stops it.
+```sh
+cargo run --features ctadl,profile --release --example ctadl_profile -- \
+    backflash.apk --k 1 --timeout 120 |
+  awk '/=== relation sizes ===/{s=1;next} /^$/{s=0} s' | sort -k3 -nr
+```
 
-That is the cause. There is also a large constant factor on top of it — the
-congruence join cannot use an index and rescans a multi-million-tuple relation
-every iteration — but fixing the constant would only buy time, not termination.
+```
+points size: 1061910          <-- the largest thing in the run
+pub_edge size: 624929
+edge size: 245047
+path_used size: 76332
+pub_points size: 41587
+in_proc size: 29166           <-- the input
+root_map size: 22325
+actual_arg size: 14858
+...
+paths size: 741               <-- the bound itself
+```
+
+`--features ctadl` is what compiles the front end (`src/ctadl.rs`), and
+`profile` is what compiles the instrumented copy of the rules; the example
+target requires both. `--timeout` is a wall-clock stop checked between
+iterations, so it is a ceiling, not a schedule — at `k = 1` this run converges
+long before it. The memory and `k`-sweep commands are at the end.
+
+`backflash.apk` is a TaintBench Android app, and it is the input that motivated
+the `paths` relation of `src/ir.rs` — the syntactic bound on the access-path
+vocabulary computed by `src/path_bound.rs` and tested against by every rule
+that lengthens a path. Without such a bound the fixpoint does not exist on this
+program: suffix congruence feeds itself through `path_used`, cycles in `edge`
+make the closure infinite, and the clock is the only thing that stops it.
+`src/path_bound.rs` sets out the argument. This document measures what the
+analysis does on the app now that the bound is in place.
+
+Everything below comes from two binaries:
+
+- `examples/ctadl_profile.rs` — the same rules as `HybridAnalysis`, from the
+  same `hybrid_rules` source, under Ascent's `#![measure_rule_times]`. Rule
+  times, relation sizes, and the shape of the access paths.
+- `examples/ctadl_memory.rs` — the allocator accounting of `src/mem.rs`,
+  pointed at an import. Bytes, per relation, with the indices split out.
+
+The commands for both are at the end; the short one is at the top.
 
 ## What the input looks like
 
-The translation is not the problem. It takes 0.6s and produces a small,
+Decoding the import and translating it takes 0.4s, and produces a small,
 ordinary fact base:
 
 ```
-3898 CIR functions  ->  2375 procedure   29166 in_proc     5526 virtual_call
-                        2477 direct_call  4330 lookup       754 entry
+3898 CIR functions  ->  2375 procedure   29166 in_proc    5526 virtual_call
+                         754 entry        4330 lookup     2477 direct_call
 ```
 
-Note `virtual_call` (5526) is more than twice `direct_call` (2477), and no
-CTADL front end populates `load_index_var`/`store_index_var`. So on this input
-"critical statement" means "unresolved dispatch", and there are a lot of them.
+`virtual_call` is more than twice `direct_call`, and no CTADL front end
+populates `load_index_var`/`store_index_var`. So on this input "critical
+statement" means "unresolved dispatch", and there are a lot of them: 473
+critical statements, in 1034 pending instances at `k = 1`.
 
-## Where the time goes: one SCC, then two rules
-
-The program has 50 SCCs. Forty-nine of them finish in about 60 milliseconds
-between them. The fiftieth does not finish at all:
-
-```
-scc 41: iterations: 6, time: 7.914458ms
-scc 42: iterations: 1, time: 146.666µs
-scc 43: iterations: 2, time: 182.375µs
-scc 44: iterations: 1, time: 29.541µs
-scc 45: iterations: 8, sum of rule times: 455.283837205s     <-- 99.5% of wall
-```
-
-SCC 45 is stratum B, the big mutually-recursive block. Eight iterations, 455
-seconds, still going. (Asking for a 120s timeout produced a 457s run: Ascent
-only checks the deadline between iterations, and a single iteration here takes
-about a minute. That is a symptom, not a measurement error.)
-
-Inside SCC 45 there are 99 rules. Four of them account for 99.8% of it:
-
-```
-     secs      %  rule
-   208.45  45.8%  edge <-- edge_indices_none_total, path_used_indices_0_1_delta, if let ⋯, if ⋯
-   161.23  35.4%  edge <-- edge_indices_none_total, path_used_indices_0_1_delta, if let ⋯, if ⋯
-    76.13  16.7%  edge <-- edge_indices_none_delta, path_used_indices_0_1_total+delta, if let ⋯, if ⋯
-     8.79   1.9%  edge <-- edge_indices_none_delta, path_used_indices_0_1_total+delta, if let ⋯, if ⋯
-     ----
-     0.70   0.2%  the other 95 rules, combined
-```
-
-Those four are the two **suffix congruence** rules of `src/analysis.rs:238-251`,
-each in the two semi-naive variants Ascent generates:
-
-```rust
-edge(p.clone(), sup2.clone(), sub.extend(rest)) <--
-    edge(p, sup, sub),
-    path_used(p, sup.base, sup2),
-    if let Some(rest) = sup2.strip_prefix(sup),
-    if !rest.is_empty();
-
-edge(p.clone(), sup.extend(rest), sub2.clone()) <--
-    edge(p, sup, sub),
-    path_used(p, sub.base, sub2),
-    if let Some(rest) = sub2.strip_prefix(sub),
-    if !rest.is_empty();
-```
-
-The relation they feed grows to 9.7 million tuples from a 29-thousand-statement
-input — a 334× blowup — before we stop it:
-
-```
-edge          9,747,467
-path_used       616,299
-points          172,632
-in_proc          29,166   (the input)
-```
-
-## It is not a scaling problem
-
-The obvious reading — "2375 procedures is just a lot" — is wrong. Shrinking the
-input does not help:
-
-| input | statements | result |
-|---|---|---|
-| all 2375 procedures | 29166 | no convergence, 10.2 GB, killed at 27 min |
-| 25 largest procedures | 9670 | no convergence |
-| **1 largest procedure** | **2039** | **no convergence**, `edge` = 1.47M |
-
-One procedure. `Lcom/adobe/flashplayer_/AdobeUtil;->onCreate()V`, 2039
-statements, and the fixpoint does not close. Nothing interprocedural is
-involved.
-
-Nor is it Hybrid Inlining's context sensitivity. Setting `--k 0`, which
-forbids propagation entirely, changes nothing:
-
-```
-k=1, one procedure, 45s:  no convergence, edge = 1,465,954
-k=0, one procedure, 60s:  no convergence, edge = 1,462,439
-```
-
-So the blowup is in the intraprocedural constraint closure — the part that is
-just field-sensitive points-to — and the hybrid machinery on top of it is
-innocent.
-
-## Why it never terminates
-
-Access paths have no length bound anywhere in the rules. The `k_limit` bounds
-`CritId::depth()`, which is the *call string* of a pending critical statement.
-It says nothing about `AccessPath::accessors`.
-
-Measured on that one procedure (25s budget, so smaller than the table above),
-at the moment we stop it:
-
-```
-=== access-path depth in `edge` ===
-  depth   0:        422  ( 0.03%)
-  depth   1:       2568  ( 0.17%)
-  depth   2:      15408  ( 1.01%)
-  depth   3:      91818  ( 6.03%)
-  depth   4:     399312  (26.24%)
-  depth   5:     713871  (46.91%)
-  depth   6:     287463  (18.89%)
-  depth   7:      11048  ( 0.73%)
-```
-
-The source IR writes **at most one accessor per statement**: a `load_field` is
-`to = base.f`, depth 1. Everything past depth 1 was synthesized by congruence,
-and that is 99.8% of the paths. The distribution is not converging on a
-maximum — it has a frontier at depth 6-7 that is still advancing when we cut it
-off.
-
-The deepest path at that moment:
-
-```
-v51@...AdobeUtil;->onCreate()V . [] . <AdobeUtil.wl> . <AdobeUtil.wl>
-                               . <AdobeUtil.wl> . <AdobeUtil.wl> . length . []
-```
-
-`AdobeUtil.wl` has type `PowerManager$WakeLock`. A `WakeLock` does not have a
-field `AdobeUtil.wl`. So `.wl.wl` denotes no path through any heap that can
-exist — and neither do most of the paths being built:
-
-```
-paths repeating an accessor: 426,679 of 503,560 distinct  (84.7%)
-```
-
-### The mechanism
-
-`path_used` is fed from `edge`'s own two columns (`src/analysis.rs:234-236`):
-
-```rust
-path_used(p, a.base, a) <-- edge(p, a, _);
-path_used(p, b.base, b) <-- edge(p, _, b);
-```
-
-So every longer path congruence invents is immediately a `path_used` fact, and
-`path_used` is congruence's own second premise. The two rules pump each other.
-One cycle in `edge` plus one strict extension is enough to run forever:
-
-```
-given   a ⊇ b   and   b ⊇ a.f
-rule 1                       gives   a.f ⊇ b.f
-rule 1 again, on b ⊇ a.f     gives   b.f ⊇ a.f.f
-rule 1 again, on a ⊇ b       gives   a.f.f ⊇ b.f.f
-...
-```
-
-Those cycles are there. In that single procedure:
-
-```
-503,560 distinct paths, 760,955 edges
-paths on a cycle: 25,410   (largest SCC: 9 paths)
-```
-
-25 thousand paths sit on a cycle in the constraint graph. Each one is a
-generator.
-
-## Why it is also slow per iteration
-
-Separate from termination, the constant factor is bad, for two compounding
-reasons visible in Ascent's own plan.
-
-**The join cannot use an index.** The plan says `edge_indices_none_total` —
-`none` meaning no key, i.e. a full scan of `edge`. Ascent indexes on whole
-columns, and this join keys on `sup.base`, which is a *projection of* column 1,
-not a column. Compare a rule that does get an index:
-
-```
-points <-- edge_indices_0_2_total, points_indices_0_1_delta [SIMPLE JOIN]      0.07s
-edge   <-- edge_indices_none_total, path_used_indices_0_1_delta, if let ⋯    208.45s
-```
-
-**And the scan is over `_total`, not `_delta`.** Every new `path_used` tuple
-forces a rescan of the entire, by-then-enormous `edge` relation. Combined with
-the fan-out of the join:
-
-```
-paths per base: n=134  mean=3758  p50=2504  p99=7022  max=12900
-=> congruence scans ~760,955 edges x ~3758 paths/base per iteration
-```
-
-134 distinct bases, thousands of paths hanging off each. That is on the order
-of 2.9 billion candidate pairs per iteration, each ending in a `strip_prefix`.
-Which is exactly what a sample of the stuck 27-minute process shows — 32% of
-samples sitting in `memcmp`, from prefix comparison and from hashing the
-string-backed `Proc`/`Base` keys:
-
-```
-1104 _platform_memcmp  (in libsystem_platform.dylib)
- 195 DYLD-STUB$$memcmp
-     ... of 3550 total samples
-```
-
-## Hypothesis, stated plainly
-
-1. **The cause is unbounded access-path depth.** Suffix congruence has no
-   length cap, `path_used` feeds it from its own output, and cycles in `edge`
-   make the closure infinite. The analysis has no fixpoint on this input, at
-   any `k`, on a single procedure. This is the standard failure mode of a
-   field-sensitive analysis that materializes access paths without widening.
-
-2. **The constant factor is a missing index.** The congruence join keys on
-   `sup.base`, which Ascent cannot index because it is not a column, so each
-   iteration full-scans `edge` with a fan-out of ~3700. This makes the
-   non-termination expensive rather than causing it.
-
-3. **The precision being bought is fictional.** 85% of the paths are
-   type-impossible (`.wl.wl`). Bounding depth is not only necessary for
-   termination — at these depths it costs nothing real.
-
-## What to try, in order
-
-- **Cap access-path length** and widen past it (truncate to depth *d* and
-  append an unknown-suffix accessor, the way `Accessor::IndexUnknown` already
-  handles an unknown index). This is the fix for the cause; everything else is
-  a speedup. Worth sweeping *d* = 2, 3, 4 to see where precision on the
-  TaintBench queries stops improving — the depth histogram suggests well below
-  where it currently runs.
-
-- **Make the join indexable** by giving `edge` its bases as real columns
-  (`edge(Proc, Base, AccessPath, Base, AccessPath)` or a companion relation), so
-  Ascent can plan a `[SIMPLE JOIN]` on `(p, base)` instead of a full scan.
-
-- **Filter congruence by type.** Reject an extension whose accessor is not a
-  field of the static type reached so far. The EDB already has `alloc_type`,
-  `proc_type` and the field names carry their declaring class, so `.wl.wl` is
-  rejectable. This would remove 85% of the paths outright.
-
-- **Restrict congruence to published roots.** It currently fires on every path
-  in the procedure, including purely local ones that `pub_edge` will discard.
-  Applying it only to `pub_root`-based paths would shrink both sides of the
-  join.
-
-## Reproducing
-
-```sh
-# the profile above
-cargo run --features ctadl,profile --release --example ctadl_profile -- \
-    backflash.apk --k 1 --timeout 120
-
-# the single-procedure case, which is enough to show everything
-cargo run --features ctadl,profile --release --example ctadl_profile -- \
-    backflash.apk --k 1 --timeout 25 --max-procs 1
-
-# the bytes, per relation, at four sizes
-cargo run --features ctadl --release --example ctadl_memory -- \
-    backflash.apk --k 1 --max-procs 100 --max-procs 400 --max-procs 1000
-```
-
-`--max-procs N` keeps the N procedures with the most statements and the facts
-that mention only those; type-level facts (`lookup`, `direct_subtype`,
-`alloc_type`) are kept whole so that what counts as critical does not change.
-
-<a id="after-the-bound"></a>
-
-# After the bound
-
-Same input, same command, with `paths` in place. It converges.
+## The run
 
 ```
 procs=2375 stmts=29166 virtual_call=5526 direct_call=2477 k=1
 converged=true wall=3.33s
 ```
 
-Peak physical footprint is 1.67 GB, from a second run polled by `footprint`
-(the polling costs it about a third of a second of wall). Against the run
-above: no convergence, 10.2 GB, killed at 27 minutes. The
-whole fixpoint is now shorter than the *translation* used to make it look
-cheap by comparison.
+Peak physical footprint is 1.8 GB, from `/usr/bin/time -l` on a second run.
+Everything from here to "How it grows with k" is at `k = 1`.
 
-## The vocabulary, and what it did to the paths
+## The vocabulary, and what it does to the paths
 
 `paths` holds 741 suffixes. That is the entire access-path alphabet the
-program's syntax asks for, and no rule may leave it:
+program's syntax asks for, and no rule may leave it. What ends up in `edge`:
 
 ```
-                     before (25s, 1 proc)        after (3.3s, all 2375 procs)
-depth 0                    0.03%                       13.76%
-depth 1                    0.17%                       81.79%
-depth 2                    1.01%                        4.40%
-depth 3                    6.03%                        0.04%
-depth 4                   26.24%                        0.00%  (17 tuples)
-depth 5                   46.91%                          —
-depth 6                   18.89%                          —
-depth 7                    0.73%                          —
-repeating an accessor      84.7%                        1.8%
+=== access-path depth in `edge` ===
+  depth 0      67442   13.76%
+  depth 1     400865   81.79%
+  depth 2      21557    4.40%
+  depth 3        213    0.04%
+  depth 4         17    0.00%
 ```
 
-The distribution now sits where the front end put it — 82% of paths are the
-single accessor a `load_field` writes down — instead of on a frontier that was
-still advancing when the clock stopped it. The deepest path left is four
-accessors and is a real chain through real fields:
+The distribution sits where the front end put it: the source IR writes at most
+one accessor per statement, and 82% of the paths in the finished relation are
+exactly that one accessor. The deepest path is four accessors and is a real
+chain through real fields:
 
 ```
 par0@…LoaderManagerImpl$LoaderInfo;->callOnLoadFinished(…)
@@ -352,29 +113,37 @@ par0@…LoaderManagerImpl$LoaderInfo;->callOnLoadFinished(…)
   .<FragmentActivity.mFragments> .<FragmentManagerImpl.mNoTransactionsBecause>
 ```
 
-Nothing like `x.wl.wl.wl.wl.length[]` survives. The cycles that generated
-those are still there — 3,846 paths sit on one, largest SCC 205 — they simply
-no longer produce anything new, which is the point: the bound does not remove
-the cycles, it removes their range.
+Only 1,324 of the 75,284 distinct paths (1.8%) repeat an accessor — the
+signature of a type-impossible path like `x.wl.wl`, which is what congruence
+invents when nothing stops it.
 
-The join fan-out collapses with the vocabulary:
+The cycles that would generate those are still there:
 
 ```
-paths per base   before:  n=134    mean=3758  p50=2504  p99=7022  max=12900
-                 after:   n=24145  mean=3     p50=1     p99=44    max=49
+  75284 distinct paths, 245047 edges
+  paths on a cycle: 3846  (largest SCC: 205 paths)
 ```
 
-## Where the time goes now
+They simply no longer produce anything new. The bound does not remove the
+cycles, it removes their range.
 
-One SCC still dominates — stratum B, as before — but it closes:
+The congruence join's fan-out — the number of paths sharing a base, which is
+the multiplier on every scan of `edge` — is correspondingly small:
+
+```
+  paths per base: n=24145  mean=3  p50=1  p99=44  max=49
+```
+
+## Where the time goes
+
+One SCC dominates: stratum B, the big mutually-recursive block.
 
 ```
 scc 45: iterations: 46, time: 3.259s   (sum of rule times 2.579s)
-everything else: 62ms
+the other 49 SCCs: 62ms between them
 ```
 
-Inside it, the ranking has changed hands. Suffix congruence is no longer the
-whole cost; the alias closure is:
+Inside it there are 99 rules, of which ten are 86% of the time:
 
 ```
      ms      %  rule
@@ -390,18 +159,23 @@ whole cost; the alias closure is:
    58.3   2.3%  edge     <-- edge_delta, path_used, ⋯, paths         (congruence, delta)
 ```
 
-The four congruence variants together are 722ms — 28% of the SCC, down from
-99.5%, and down from 455 *seconds* in absolute terms. Note what did not
-change: the plan still says `edge_indices_none_total`, a full scan. Hypothesis
-2 is still true and still unfixed; the bound made it affordable rather than
-fatal. A real index on `(proc, base)` is worth roughly half a second here.
+The cost is the alias closure — `points`, and the `pub_edge` publication built
+on it — with the four suffix-congruence variants together at 722ms, 28% of the
+SCC.
+
+One thing the profile still says out loud: congruence's plan is
+`edge_indices_none_total`, a full scan. Ascent indexes on whole columns and
+this join keys on `sup.base`, a *projection of* column 1, so it cannot be
+planned as a `[SIMPLE JOIN]`. With the fan-out down to 3 that costs about
+600ms rather than being fatal, but it is still the second-largest line item
+and the most obvious speedup available.
 
 Relation sizes at the fixpoint:
 
 ```
-points     1,061,910      <-- the new leader
+points     1,061,910      <-- the largest thing in the run
 pub_edge     624,929
-edge         245,047      (was 9,747,467 and still climbing)
+edge         245,047      (8.4x the input)
 path_used     76,332
 pub_points    41,587
 root_map      22,325
@@ -409,13 +183,7 @@ paths            741      (the bound itself)
 in_proc       29,166      (the input)
 ```
 
-`edge` is now 8.4× the input rather than 334× — and `points`, the alias
-relation congruence used to feed, is the largest thing in the run.
-
-## Where the bytes go now
-
-`examples/ctadl_memory.rs` is the same allocator accounting
-`examples/memory.rs` does over the families, pointed at an import.
+## Where the bytes go
 
 ```
 ## whole program — 2375 procedures, 29166 statements
@@ -438,15 +206,17 @@ relation congruence used to feed, is the largest thing in the run.
 Two things worth keeping:
 
 - **The suffixes cost nothing.** 4.8 MiB of `Arc` payload against 1.7 GiB
-  retained. Bounding the vocabulary to 741 suffixes means every access path in
-  the run shares one of 741 allocations, so the part of memory that used to
-  grow with path depth has stopped registering at all.
+  retained. A vocabulary of 741 suffixes means every access path in the run
+  shares one of 741 allocations, so the part of memory that grows with path
+  depth does not register at all.
 
-- **71% of the memory is Ascent's indices**, not tuples. That is now the thing
-  to attack if 1.7 GiB is too much: it is decided by which columns the rules
-  join on, and `relation_sizes_summary()` cannot see any of it.
+- **71% of the memory is Ascent's indices**, not tuples. That is the thing to
+  attack if 1.7 GiB is too much: it is decided by which columns the rules join
+  on, and `relation_sizes_summary()` cannot see any of it.
 
-## How it grows
+## How it grows with the program
+
+`--max-procs N` keeps the N procedures with the most statements:
 
 ```
   procs                100         400        1000       whole
@@ -459,27 +229,173 @@ Two things worth keeping:
 
 Doubling `|P|` costs about 4.7× the tuples and 6× the bytes — `tuples ~
 |P|^2.3`, `retained ~ |P|^2.6` over this range. That is the intraprocedural
-alias closure being quadratic (`tests/scaling.rs`:
-`points_is_quadratic_in_a_single_procedure`), which is expected and bounded,
-not the runaway this document was written about. The 29% rise in bytes per
-tuple across the sweep is the indices growing faster than the relations they
-index, which is the same finding as the split above.
+alias closure being quadratic, which `tests/scaling.rs` already pins down
+(`points_is_quadratic_in_a_single_procedure`): expected, and bounded. The 29%
+rise in bytes per tuple across the sweep is the indices growing faster than the
+relations they index, the same finding as the split above.
+
+## How it grows with k
+
+Same input, whole program, `--timeout 300` each. The runs overshoot the
+deadline because Ascent checks the clock only between iterations, and at
+`k >= 4` a single iteration takes minutes:
+
+```
+  k                     1           2            4            8           16
+  outcome       converged   converged      timeout      timeout      timeout
+  wall               3.4s       23.2s         362s         364s         508s
+  peak footprint   1.8 GB      6.8 GB      35.8 GB      57.6 GB     144.2 GB
+  iterations           46          45           20           16           13
+  pending           1,034       2,183       13,451    3,370,221   78,915,729
+  crit_map          4,561      13,990      174,246   27,404,613  101,941,225
+  edge            245,047   1,817,143   15,221,101   15,113,082    2,345,930
+  points        1,061,910   3,550,302   18,386,632    8,205,158    1,599,446
+  max depth             4           4            4            4            4
+```
+
+The `k >= 4` columns are snapshots at the cutoff, not fixpoints. Read them as
+"where it had got to", which is why `edge` and `points` are *smaller* at k=16
+than at k=8: the k=16 run spent its whole budget minting instances and never
+got far into the alias closure.
+
+Two things the table says.
+
+**The access-path bound is orthogonal to the k-limit, and it holds.** `paths`
+stays 741 by construction, and the depth histogram tops out at 4 accessors at
+every k — the same LoaderManagerImpl chain is the deepest path in all five
+runs. Nothing about raising k lengthens a path.
+
+**What explodes with k is the instances.** `pending` is one row per
+`(procedure, CritId)`, and a `CritId` is a call string of up to k sites; each
+level multiplies by the call sites that reach it, which is the doubling
+`tests/scaling.rs::call_strings_double_per_level_unless_k_caps_them` pins down
+on a synthetic input. Here `pending` goes 1,034 → 2,183 → 13,451 → 3.4M →
+78.9M, and `crit_map` — the renaming that carries a caller's paths into an
+instance — runs an order of magnitude above it (13× at k=4, 8× at k=8). From
+k=8 on, `crit_map` is the largest relation in the run and everything else is
+noise beside it.
+
+So on this app the analysis is memory-bound in k, not time-bound: k=16 peaked
+at 144 GB of physical footprint on a 128 GB machine, which is past the point
+where the numbers mean anything but "it thrashed". Practically, `k = 1` is the
+setting this app runs at, `k = 2` is affordable at 7× the time and 4× the
+memory, and `k = 4` needs the instance space bounded by something other than
+the call-string length before it is worth measuring.
 
 ## What is left to try
 
-The list at the top of this document, minus the item that was done. In the
-order the numbers now argue for:
+In the order the numbers argue for:
 
-1. **Index the congruence join** — `edge_indices_none_total` is still a full
-   scan, and it is now the second-largest line item (~600ms of 2.6s). Give
-   `edge` its bases as real columns, or add a companion relation, so Ascent
-   can plan `[SIMPLE JOIN]` on `(p, base)`.
-2. **Shrink the index footprint** — 71% of 1.7 GiB. Fewer binding patterns
-   over `points` and `pub_edge` is the lever.
-3. **Sweep precision against the bound.** The vocabulary is syntactic, so it
-   is not a *depth* knob; but `path_bound.rs` decides how far it follows local
-   data flow, and the TaintBench queries are what should decide how far is far
-   enough.
-4. **Type-filtering congruence** is no longer urgent: 1.8% of paths repeat an
-   accessor now, against 84.7% before, so the fiction it would remove is
-   mostly gone already.
+1. **Index the congruence join.** `edge_indices_none_total` is a full scan and
+   the second-largest line item (~600ms of 2.6s). Give `edge` its bases as real
+   columns (`edge(Proc, Base, AccessPath, Base, AccessPath)`, or a companion
+   relation) so Ascent can plan `[SIMPLE JOIN]` on `(p, base)`.
+
+2. **Shrink the index footprint** — 71% of 1.7 GiB. Fewer binding patterns over
+   `points` and `pub_edge` is the lever.
+
+3. **Bound the instance space.** `k` is the only thing limiting it, and it
+   limits it exponentially: at `k = 8` the run is 27M `crit_map` tuples and
+   nothing else matters. If `k > 2` is wanted on an app this size, the
+   instances need a second bound — merging instances whose decisive slot has
+   the same points-to set, or a tighter `blocked`, since `blocked` is what
+   decides whether an instance is copied into its callers at all.
+
+4. **Sweep precision against the bound.** The vocabulary is syntactic, so there
+   is no depth knob to turn; but `path_bound.rs` decides how far it follows
+   local data flow, and the TaintBench queries are what should decide how far
+   is far enough.
+
+5. **Type-filtering congruence** — rejecting an extension whose accessor is not
+   a field of the static type reached so far — is no longer urgent: 1.8% of the
+   paths repeat an accessor, so there is little fiction left for it to remove.
+
+## Measuring this, on macOS
+
+Every memory figure above is a **physical footprint**, never RSS. `ps -o rss=`
+counts only resident *uncompressed* pages, and macOS compresses cold ones, so
+a run holding 20 GB can show 5 GB of RSS. Reading RSS is how a job that is
+thrashing the machine gets called healthy. Activity Monitor's "Memory" column
+is the footprint; so is `footprint -p <pid>` and `/usr/bin/time -l`'s
+`peak memory footprint`.
+
+Take the number two different ways, for two different jobs:
+
+- **To report a finished run**, use `/usr/bin/time -l` and read
+  `peak memory footprint`. It is a true high-water mark kept by the kernel, not
+  a sample, so nothing can slip between polls. It has to wrap the binary
+  *directly* — see trap 2.
+
+- **To cap a run in flight**, poll `footprint`. `scripts/memguard.sh` does it:
+  `scripts/memguard.sh <limit-GiB> <command> [args...]` runs the command, polls
+  the whole process tree every 2s, kills the tree if the total passes the cap,
+  and exits 137 if it did.
+
+The two compose, in this order and not the other — the guard outside, `time -l`
+inside, wrapping the binary:
+
+```sh
+./scripts/memguard.sh 64 /usr/bin/time -l \
+    ./target/release/examples/ctadl_profile backflash.apk --k 16 --timeout 300
+```
+
+The polled peak is *not* a substitute for `time -l`'s: at a 2s interval the
+`k = 1` run here gets two samples and reports 0.98 GiB against the 1.65 GiB
+`time -l` sees, because the fixpoint is over in 3.3s. Poll to enforce a cap and
+to watch the trajectory (climbing vs plateaued); quote `time -l` for a peak.
+
+Three ways to get a guard that silently never fires, all of which have happened
+here:
+
+1. **Finding the PID with `pgrep -f`.** A pattern matching the binary also
+   matches any shell whose command line mentions it — a `for k in ...; do
+   ./target/release/examples/ctadl_profile ...` loop, for instance. The guard
+   then polls a shell, reads a small, perfectly valid integer, and never fires,
+   while the real process runs uncapped. This is what let the `k = 16` run
+   above reach 144 GB on a 128 GB machine. Take the PID from `$!` of the
+   command the guard itself launched, and from nowhere else.
+
+2. **Measuring a wrapper instead of the work.** `phys_footprint` is per
+   process and is *not* aggregated over children the way `maximum resident set
+   size` is. Run `/usr/bin/time -l` on a shell script that runs the analysis
+   and it reports `peak memory footprint: 2130304` — 2 MB, the shell's own —
+   next to a `maximum resident set size` of 1.79 GB from the child. A poller
+   aimed at the wrapper's PID is blind the same way, which is why
+   `memguard.sh` sums the tree, walking it by parent (`pgrep -P`) and never by
+   name. So: `time -l` goes *inside* the guard, wrapping the binary itself.
+
+3. **Parsing the wrong field.** `footprint -p <pid> -f bytes` prints
+   `phys_footprint: 1868136 B`; the trailing `B` is its own field, so
+   `awk '{print $NF}'` yields `"B"` and every numeric comparison against it is
+   false. Take `$2`. Without `-f bytes` the units switch with magnitude
+   (`1856 KB`, then `19.50 GB`), so a parser that assumes KB reads 19.5 GB as
+   19 KB. Always `-f bytes`, always `$2`.
+
+A sanity check on the *shape* of the reading (is it a positive integer?) cannot
+catch any of these on its own — a wrong process and a wrong scale both yield
+plausible integers. Check the first sample against a number you already
+believe: `/usr/bin/time -l` on a short run, or Activity Monitor.
+
+## Reproducing
+
+```sh
+# rule times, relation sizes, access-path shape
+cargo run --features ctadl,profile --release --example ctadl_profile -- \
+    backflash.apk --k 1 --timeout 120
+
+# the bytes, per relation, at four sizes
+cargo run --features ctadl --release --example ctadl_memory -- \
+    backflash.apk --k 1 --max-procs 100 --max-procs 400 --max-procs 1000
+
+# the k sweep: 1, 2, 4, 8, 16, each under a 64 GiB cap.  `time -l` gives the
+# peak; memguard kills the run if it climbs past what the machine can hold.
+cargo build --features ctadl,profile --release --example ctadl_profile
+for k in 1 2 4 8 16; do
+    ./scripts/memguard.sh 64 /usr/bin/time -l \
+        ./target/release/examples/ctadl_profile backflash.apk --k $k --timeout 300
+done
+```
+
+`--max-procs N` keeps the N procedures with the most statements and the facts
+that mention only those; type-level facts (`lookup`, `direct_subtype`,
+`alloc_type`) are kept whole so that what counts as critical does not change.

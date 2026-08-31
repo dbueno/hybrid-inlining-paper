@@ -26,6 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut k = 1usize;
     let mut timeout = 60u64;
     let mut max_procs: Option<usize> = None;
+    let mut top_paths = 0usize;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -33,8 +34,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--k" => k = args.next().unwrap_or_default().parse()?,
             "--timeout" => timeout = args.next().unwrap_or_default().parse()?,
             "--max-procs" => max_procs = Some(args.next().unwrap_or_default().parse()?),
+            "--top-paths" => top_paths = args.next().unwrap_or_default().parse()?,
             "-h" | "--help" => {
-                eprintln!("usage: ctadl_profile <import>... [--k N] [--timeout SECS] [--max-procs N]");
+                eprintln!(
+                    "usage: ctadl_profile <import>... [--k N] [--timeout SECS] \
+                     [--max-procs N] [--top-paths N]"
+                );
                 return Ok(());
             }
             _ => imports.push(a),
@@ -106,6 +111,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(w) = widest {
         println!("  deepest: {w}");
+    }
+
+    // The histogram says how deep the paths are; this says which ones they
+    // are. A path's count is how many `edge` tuples mention it on either
+    // side, so the head of this list is what the congruence and alias joins
+    // actually spend their scans on.
+    if top_paths > 0 {
+        let mut count: std::collections::HashMap<&AccessPath, usize> = Default::default();
+        for (_, sup, sub) in &a.edge {
+            for w in [sup, sub] {
+                *count.entry(w).or_default() += 1;
+            }
+        }
+        let mut v: Vec<(&AccessPath, usize)> = count.into_iter().collect();
+        v.sort_unstable_by_key(|(_, n)| std::cmp::Reverse(*n));
+        let n = top_paths.min(v.len());
+        // Ties are arbitrary out of the hash map; order the slice we print.
+        v[..n].sort_by_cached_key(|(w, n)| (std::cmp::Reverse(*n), w.to_string()));
+        println!("\n=== top {n} access paths in `edge`, by occurrences (of {} distinct) ===", v.len());
+        for (i, (w, c)) in v[..n].iter().enumerate() {
+            println!("{:>4}. {c:>9}  d{}  {w}", i + 1, w.accessors.len());
+        }
     }
 
     // What actually pumps. A path only grows via congruence, and congruence

@@ -50,7 +50,7 @@
 //! | A | [`HybridAnalysis::sig_size`], [`HybridAnalysis::critical`], [`HybridAnalysis::eff_direct`], [`HybridAnalysis::is_called`] | `count` over the EDB (N1) |
 //! | A′ | [`HybridAnalysis::uncalled`] | `!is_called`, over stratum A only |
 //! | A″ | [`HybridAnalysis::carries`], [`HybridAnalysis::decisive_var`], [`HybridAnalysis::slot_from_formal`], [`HybridAnalysis::will_propagate`] | none — positive over A |
-//! | B | **the SCC**: [`HybridAnalysis::edge`], [`HybridAnalysis::points`], [`HybridAnalysis::pending`], [`HybridAnalysis::pub_edge`], [`HybridAnalysis::blocked`], [`HybridAnalysis::top`], [`HybridAnalysis::resolve`], [`HybridAnalysis::index_acc`] | `!will_propagate`, over stratum A″ only |
+//! | B | **the SCC**: [`HybridAnalysis::edge`], [`HybridAnalysis::points`], [`HybridAnalysis::pending`], [`HybridAnalysis::pub_points`], [`HybridAnalysis::blocked`], [`HybridAnalysis::top`], [`HybridAnalysis::resolve`], [`HybridAnalysis::index_acc`] | `!will_propagate`, over stratum A″ only |
 //! | C | [`HybridAnalysis::adequate`], [`HybridAnalysis::settled`] | `!blocked`, over the finished fixpoint |
 //!
 //! Stratum C is reporting only: it feeds nothing back, so negating over B is
@@ -125,10 +125,14 @@ use crate::ir::{Alloc, ArgIdx, Const, Field, Line, Proc, Program, Sig, Stmt, Typ
 /// quantities that are each exponential in `k`. See `backflash-profile.md`.
 ///
 /// The domain is exactly `pub_root(callee)`, which is exactly the set of bases
-/// `pub_edge(callee, …)` and `pub_points(callee, …)` can carry, so the guards
-/// the tabulated version carried on its rule bodies — `formal(callee, i, _)`
-/// for a `Param`, `pending(callee, id2)` (and `crit_operand`) for a
-/// placeholder — are already discharged by the join that reaches here. What is
+/// the published summary can carry, so the guards the tabulated version
+/// carried on its rule bodies — `formal(callee, i, _)` for a `Param`,
+/// `pending(callee, id2)` (and `crit_operand`) for a placeholder — are already
+/// discharged by the join that reaches here. Since the domain is `pub_root`
+/// exactly, this function is also the *publication filter* for the path half
+/// of the summary: the rule that inlines it drives on `points(callee, …)`
+/// directly, and a local, or a root of some other procedure, is dropped by the
+/// `None` below rather than by a `pub_root` guard. What is
 /// *not* implied is the k-limit on nesting, and that is the `None` below:
 /// beyond it the callee's placeholder has no name in the holder, and the
 /// constraint mentioning it is dropped exactly as the missing `crit_map` row
@@ -468,14 +472,49 @@ ascent_source! { hybrid_rules:
     pub_root(p.clone(), Base::CritRet(id.clone())) <-- pending(p, id);
     pub_root(p.clone(), Base::CritSlot(id.clone(), *i)) <-- pending(p, id), crit_operand(id, i);
 
-    /// `pub_edge(p, a, b)`: the constraint `a ⊇ b` of `p`'s published
-    /// summary. Transitivity through locals has already happened inside
-    /// `points`, so this is the local-eliminated closure.
-    relation pub_edge(Proc, AccessPath, AccessPath);
-    pub_edge(p.clone(), a.clone(), b.clone()) <--
-        points(p, a, ?PtVal::Path(b)),
-        pub_root(p, a.base),
-        pub_root(p, b.base);
+    // `p`'s published *path* constraints — the `a ⊇ b` half of the summary,
+    // local-eliminated because transitivity through locals has already
+    // happened inside `points` — used to be a relation of its own:
+    //
+    //     relation pub_edge(Proc, AccessPath, AccessPath);
+    //     pub_edge(p, a, b) <-- points(p, a, ?PtVal::Path(b)),
+    //                           pub_root(p, a.base), pub_root(p, b.base);
+    //
+    // It is a filtered projection of `points` and nothing else, and the filter
+    // stops filtering as `k` rises: `pub_root` grows as `k^1.36` against
+    // `points` at `k^2.36`, so the table held 51% of `points` at `k = 1` and
+    // 96% of it at `k = 8` — a second copy of the largest relation in the run,
+    // with a second index set behind it. `backflash-profile.md` measures what
+    // that cost.
+    //
+    // Both of its consumers were inlining rules that used it as a join driver,
+    // and **neither has to re-state the filter**, which is why de-tabulating
+    // it is free rather than a trade:
+    //
+    // - at a static callsite the driver is `root_map(s, a.base, ta)`, and
+    //   `root_map`'s second column holds only symbolic roots of the callee;
+    // - at a resolved critical statement it is [`crit_subst`], which is
+    //   undefined on a local and on a root of any other procedure.
+    //
+    // What `pub_root` adds beyond "symbolic, and belongs to `p`" is
+    // well-formedness — `formal(p, i, _)` behind a `par_i@p`, `pending(p, id)`
+    // (with `crit_operand`) behind a placeholder — and that is already implied
+    // for any base the join reaches, because a base only ever enters `p`'s
+    // `edge`/`points` through the rule that also establishes it: `par_i@p`
+    // through `formal`, `ret@p` through `ret`, a placeholder through
+    // `crit_origin` or through the propagation and nesting rules, each of
+    // which derives the matching `pending` alongside it. That invariant is
+    // what `pub_root` states; it is not an extra hypothesis introduced here.
+    //
+    // So the filter costs nothing to re-apply and the table costs a copy of
+    // `points`. [`HybridAnalysis::pub_edges`] recomputes the set once, after
+    // the fixpoint, for the reporting layer — the only place that ever wanted
+    // it whole.
+    //
+    // `pub_points` stays tabulated: it is the `a ⊇ {l}` half, an order of
+    // magnitude smaller, its consumers have no substitution to discharge the
+    // filter for them, and `if !v.is_path()` already keeps it off the part of
+    // `points` that grows.
 
     /// `pub_points(p, a, v)`: the `a ⊇ {l}` / `a ⊇ {c}` half of the summary.
     relation pub_points(Proc, AccessPath, PtVal);
@@ -503,8 +542,13 @@ ascent_source! { hybrid_rules:
         eff_direct(s, p), pending(p, id), blocked(p, id),
         k_limit(k), if id.depth() < *k;
 
+    // The publication filter is not spelled here: `root_map`'s second column
+    // holds only symbolic roots of `p`, so a tuple of `points` whose endpoints
+    // both survive the two lookups below is exactly a tuple `pub_edge` would
+    // have held. See the note where `pub_edge` used to be defined.
     edge(q.clone(), a.rebase(ta.clone()), b.rebase(tb.clone())) <--
-        eff_direct(s, p), in_proc(s, q, _), pub_edge(p, a, b),
+        eff_direct(s, p), in_proc(s, q, _),
+        points(p, a, ?PtVal::Path(b)),
         root_map(s, a.base, ta),
         root_map(s, b.base, tb);
 
@@ -587,8 +631,10 @@ ascent_source! { hybrid_rules:
         resolve(p, id, callee), pending(callee, id2),
         k_limit(k), if id2.nest_depth(id) <= *k;
 
+    // Likewise here: [`crit_subst`] is undefined on a local, so the two
+    // `if let`s are the publication filter as well as the substitution.
     edge(p.clone(), a.rebase(ta), b.rebase(tb)) <--
-        resolve(p, id, callee), pub_edge(callee, a, b), k_limit(k),
+        resolve(p, id, callee), points(callee, a, ?PtVal::Path(b)), k_limit(k),
         if let Some(ta) = crit_subst(callee, id, &a.base, *k),
         if let Some(tb) = crit_subst(callee, id, &b.base, *k);
 
@@ -737,6 +783,38 @@ impl HybridAnalysis {
         self.settled.iter().cloned().collect()
     }
 
+    /// The published roots as a set, so that the reporting layer can test
+    /// membership in `O(log n)` instead of scanning the relation once per
+    /// tuple of `points`.
+    fn pub_root_set(&self) -> BTreeSet<(Proc, Base)> {
+        self.pub_root.iter().cloned().collect()
+    }
+
+    /// The published *path* constraints of every procedure: `points` filtered
+    /// to tuples whose value is a path and whose both endpoints are rooted in
+    /// the published vocabulary.
+    ///
+    /// This was the `pub_edge` relation until it was de-tabulated — see the
+    /// comment where its rule used to be. The fixpoint never needed the whole
+    /// set at once, only one procedure's worth at a time under a join it can
+    /// drive from `points` directly; the reporting layer *does* want it whole,
+    /// and pays for it here, once, after convergence.
+    pub fn pub_edges(&self) -> Vec<(Proc, AccessPath, AccessPath)> {
+        let pub_root = self.pub_root_set();
+        self.points
+            .iter()
+            .filter_map(|(p, a, v)| match v {
+                PtVal::Path(b) => Some((p, a, b)),
+                _ => None,
+            })
+            .filter(|(p, a, b)| {
+                pub_root.contains(&((*p).clone(), a.base.clone()))
+                    && pub_root.contains(&((*p).clone(), b.base.clone()))
+            })
+            .map(|(p, a, b)| (p.clone(), a.clone(), b.clone()))
+            .collect()
+    }
+
     /// Whether `base` is a placeholder node of an instance `p` has settled —
     /// the internal plumbing of a decided critical statement, which the
     /// derivation keeps but no report should show.
@@ -759,15 +837,12 @@ impl HybridAnalysis {
     pub fn summaries(&self) -> BTreeMap<Proc, Summary> {
         let settled = self.settled_set();
         let mut out: BTreeMap<Proc, Summary> = BTreeMap::new();
-        for (p, sup, sub) in &self.pub_edge {
-            if Self::is_decided(&settled, p, &sup.base) || Self::is_decided(&settled, p, &sub.base)
+        for (p, sup, sub) in self.pub_edges() {
+            if Self::is_decided(&settled, &p, &sup.base) || Self::is_decided(&settled, &p, &sub.base)
             {
                 continue;
             }
-            out.entry(p.clone()).or_default().insert(Constraint::Path {
-                sup: sup.clone(),
-                sub: sub.clone(),
-            });
+            out.entry(p).or_default().insert(Constraint::Path { sup, sub });
         }
         for (p, sup, v) in &self.pub_points {
             if Self::is_decided(&settled, p, &sup.base) {

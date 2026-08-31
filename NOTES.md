@@ -9,7 +9,8 @@ pending entry with the nested stack.
 
 **Publishing**:
 `Base` are variables
-`pub_edge` contains data flow summary edges
+`pub_edge` used to contain the data flow summary edges; it is de-tabulated now, and
+`HybridAnalysis::pub_edges()` recomputes it from `points` + `pub_root` for reporting
 - `pub_root` has formals/ret plus "p
 
 

@@ -11,6 +11,17 @@ cargo bench --bench families               # wall time per family, sequential
 cargo test  --test scaling                 # the regression guards
 ```
 
+**These tables predate two de-tabulations and have not been regenerated.**
+`crit_map` and `pub_edge` are no longer relations: the first became the
+function `analysis::crit_subst`, the second is discharged by `root_map` and
+`crit_subst` where it used to be joined against, and is recomputed after the
+fixpoint by `HybridAnalysis::pub_edges()` for reporting. Every other relation
+below is unaffected — the derivation is unchanged, and `backflash-profile.md`
+records the check — so read a `crit_map` or `pub_edge` row as the shape of a
+quantity that is now computed instead of stored, and everything else as
+current. Re-running `cargo run --release --example complexity` regenerates the
+tables without them.
+
 The programs being measured are the parametric families in `src/families.rs`.
 Each turns one integer knob into a program of a fixed shape, so a fit against
 the program's EDB fact count `|P|` says something about the relation rather

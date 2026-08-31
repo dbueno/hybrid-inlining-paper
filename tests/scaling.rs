@@ -28,7 +28,14 @@ fn sizes(summary: &str) -> BTreeMap<String, usize> {
 }
 
 fn run_sizes(prog: &Program, k: usize) -> BTreeMap<String, usize> {
-    sizes(&run_hybrid(prog, k).relation_sizes_summary())
+    let h = run_hybrid(prog, k);
+    let mut m = sizes(&h.relation_sizes_summary());
+    // `pub_edge` is no longer a relation — the published path constraints are
+    // recomputed from `points` and `pub_root` on demand — but its *size* is
+    // still what several of these tests are about, so it goes into the map
+    // under its old name and they keep guarding the same property.
+    m.insert("pub_edge".to_string(), h.pub_edges().len());
+    m
 }
 
 /// Least-squares slope of `log|R|` against `log|P|`.
@@ -290,7 +297,10 @@ fn parallel_backends_derive_the_same_relations() {
         ("fields(4)", fields(4), 0),
     ];
     for (label, prog, k) in &cases {
-        let want = run_sizes(prog, *k);
+        // The raw relation map, not `run_sizes`: this test compares the
+        // *relations* the three backends derive, and `pub_edge` is no longer
+        // one of them — `run_sizes` synthesizes it for the size tests above.
+        let want = sizes(&run_hybrid(prog, *k).relation_sizes_summary());
 
         let mut par = ParallelHybridAnalysis::for_program(prog, *k);
         par.run();

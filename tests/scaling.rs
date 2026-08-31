@@ -77,7 +77,6 @@ fn figure1_relation_sizes_are_stable() {
         ("resolve", 2),
         ("settled", 2),
         ("root_map", 30),
-        ("crit_map", 6),
     ] {
         assert_eq!(m[rel], want, "figure1 k=4: {rel} changed");
     }

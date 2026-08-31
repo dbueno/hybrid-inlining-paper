@@ -137,10 +137,9 @@ fn sweep(tag: &str, ns: &[usize], pinned: bool, nested: bool) {
     let hs: Vec<H> = ns.iter().map(|&n| run_hybrid(&partial_ext(n, 3, pinned, nested), n + 2)).collect();
     let xs: Vec<f64> = ns.iter().map(|&n| n as f64).collect();
     println!("  {tag}");
-    let cols: [(&str, fn(&H) -> usize); 5] = [
+    let cols: [(&str, fn(&H) -> usize); 4] = [
         ("pending", |h| h.pending.len()),
         ("resolve", |h| h.resolve.len()),
-        ("crit_map", |h| h.crit_map.len()),
         ("points", |h| h.points.len()),
         ("edge", |h| h.edge.len()),
     ];

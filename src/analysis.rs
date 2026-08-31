@@ -112,6 +112,42 @@ use ascent::{ascent, ascent_source};
 use crate::access_path::{AccessPath, Accessor, Base, Constraint, CritId, PtVal, Suffix, Summary};
 use crate::ir::{Alloc, ArgIdx, Const, Field, Line, Proc, Program, Sig, Stmt, Type, Var};
 
+/// σ_crit: where a root of `callee`'s published summary lands when the summary
+/// is inlined at the resolved instance `id`.
+///
+/// This is the substitution the inlining rules apply, in closed form rather
+/// than as a materialized relation. It is a *function* of `(id, base)` — the
+/// callee's formals go to the placeholder's operand slots, its return to the
+/// placeholder's result, and its own pending placeholders are renamed into the
+/// holder by [`CritId::nest`] — so nothing is gained by tabulating it, and a
+/// great deal is lost: the table is keyed per `(holder, instance)` and its
+/// hybrid-in-hybrid half is `resolve ⋈ pending(callee)`, a product of two
+/// quantities that are each exponential in `k`. See `backflash-profile.md`.
+///
+/// The domain is exactly `pub_root(callee)`, which is exactly the set of bases
+/// `pub_edge(callee, …)` and `pub_points(callee, …)` can carry, so the guards
+/// the tabulated version carried on its rule bodies — `formal(callee, i, _)`
+/// for a `Param`, `pending(callee, id2)` (and `crit_operand`) for a
+/// placeholder — are already discharged by the join that reaches here. What is
+/// *not* implied is the k-limit on nesting, and that is the `None` below:
+/// beyond it the callee's placeholder has no name in the holder, and the
+/// constraint mentioning it is dropped exactly as the missing `crit_map` row
+/// used to drop it.
+///
+/// A base belonging to some procedure other than `callee` is not in σ's
+/// domain and yields `None`; today no such base reaches the inlining rules.
+pub fn crit_subst(callee: &Proc, id: &CritId, base: &Base, k: usize) -> Option<Base> {
+    match base {
+        Base::Param(p, i) if p == callee => Some(Base::CritSlot(id.clone(), *i)),
+        Base::Ret(p) if p == callee => Some(Base::CritRet(id.clone())),
+        Base::CritSlot(id2, j) if id2.nest_depth(id) <= k => {
+            Some(Base::CritSlot(id2.nest(id), *j))
+        }
+        Base::CritRet(id2) if id2.nest_depth(id) <= k => Some(Base::CritRet(id2.nest(id))),
+        _ => None,
+    }
+}
+
 // Every rule of the analysis, as a source that `HybridAnalysis` and the
 // `parallel` compile-check both include, so the two cannot drift apart. The
 // EDB these rules read comes from `crate::ir::edb`.
@@ -539,34 +575,26 @@ ascent_source! { hybrid_rules:
 
     // -- inlining a summary at a resolved critical statement ---------------
 
-    /// `crit_map(p, id, from, to)`: the substitution σ_crit for a resolution.
-    /// The callee's formals land on the placeholder's operand slots and its
-    /// return on the placeholder's result, so the constraints the caller had
-    /// already wired to the placeholder connect straight through.
-    relation crit_map(Proc, CritId, Base, Base);
-    crit_map(p.clone(), id.clone(), Base::Param(callee.clone(), *i), Base::CritSlot(id.clone(), *i)) <--
-        resolve(p, id, callee), formal(callee, i, _);
-    crit_map(p.clone(), id.clone(), Base::Ret(callee.clone()), Base::CritRet(id.clone())) <--
-        resolve(p, id, callee);
-    // Hybrid-in-hybrid: the callee's own placeholders are renamed into `p`.
-    crit_map(p.clone(), id.clone(), Base::CritSlot(id2.clone(), *j), Base::CritSlot(id2.nest(id), *j)) <--
-        resolve(p, id, callee), pending(callee, id2),
-        crit_operand(id2, j), k_limit(k), if id2.nest_depth(id) <= *k;
-    crit_map(p.clone(), id.clone(), Base::CritRet(id2.clone()), Base::CritRet(id2.nest(id))) <--
-        resolve(p, id, callee), pending(callee, id2),
-        k_limit(k), if id2.nest_depth(id) <= *k;
-
+    // The substitution σ_crit that carries `callee`'s published summary onto
+    // this instance's placeholder is [`crit_subst`], applied where it is
+    // needed. It used to be a relation, `crit_map(p, id, from, to)`, and the
+    // rules below joined against it twice. Tabulating a function is what made
+    // it the largest relation in the run at `k ≥ 8`: its hybrid-in-hybrid half
+    // was `resolve ⋈ pending(callee)`, one row per pair of call strings whose
+    // lengths sum to under `k`, and every row of it was recomputable from its
+    // own key. `backflash-profile.md` has the measurement.
     pending(p.clone(), id2.nest(id)) <--
         resolve(p, id, callee), pending(callee, id2),
         k_limit(k), if id2.nest_depth(id) <= *k;
 
-    edge(p.clone(), a.rebase(ta.clone()), b.rebase(tb.clone())) <--
-        resolve(p, id, callee), pub_edge(callee, a, b),
-        crit_map(p, id, &a.base, ta), crit_map(p, id, &b.base, tb);
+    edge(p.clone(), a.rebase(ta), b.rebase(tb)) <--
+        resolve(p, id, callee), pub_edge(callee, a, b), k_limit(k),
+        if let Some(ta) = crit_subst(callee, id, &a.base, *k),
+        if let Some(tb) = crit_subst(callee, id, &b.base, *k);
 
-    points(p.clone(), a.rebase(ta.clone()), v.clone()) <--
-        resolve(p, id, callee), pub_points(callee, a, v),
-        crit_map(p, id, &a.base, ta);
+    points(p.clone(), a.rebase(ta), v.clone()) <--
+        resolve(p, id, callee), pub_points(callee, a, v), k_limit(k),
+        if let Some(ta) = crit_subst(callee, id, &a.base, *k);
 
     // -- resolving an lv[v] access ----------------------------------------
 

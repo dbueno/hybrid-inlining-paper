@@ -399,7 +399,7 @@ macro_rules! idb {
             can_propagate, carries, decisive_var, slot_from_formal, will_propagate, stuck,
             crit_operand, call_crit, load_crit, store_crit, index_crit, decisive_slot,
             crit_sig, free_root, pub_root, pub_edge, pub_points, root_map, blocked, top,
-            resolve, index_undecidable, index_acc, crit_map, adequate, settled,
+            resolve, index_undecidable, index_acc, adequate, settled,
         ]
     };
 }

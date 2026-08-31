@@ -19,7 +19,7 @@ fn main() {
     ] {
         let h = run_hybrid(&prog, k);
         let s = h.relation_sizes_summary();
-        println!("{name:<16} all-relations={:<6} pending={:<5} resolve={:<4} crit_map={:<5} points={:<6} edge={}",
-                 total(&s), h.pending.len(), h.resolve.len(), h.crit_map.len(), h.points.len(), h.edge.len());
+        println!("{name:<16} all-relations={:<6} pending={:<5} resolve={:<4} points={:<6} edge={}",
+                 total(&s), h.pending.len(), h.resolve.len(), h.points.len(), h.edge.len());
     }
 }

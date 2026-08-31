@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use hybrid_inlining_paper::access_path::{
     AccessPath, Accessor, Base, Constraint, CritId, PtVal, Suffix, Summary,
 };
-use hybrid_inlining_paper::analysis::{HybridAnalysis, run_hybrid};
+use hybrid_inlining_paper::analysis::{HybridAnalysis, crit_subst, run_hybrid};
 use hybrid_inlining_paper::ir::*;
 use hybrid_inlining_paper::{families, figure1, figure5};
 
@@ -1242,6 +1242,55 @@ fn every_renamed_placeholder_is_pending_in_the_procedure_it_lands_in() {
             }
         }
     }
+}
+
+/// σ_crit itself, at the boundary the rules can no longer be read off a
+/// relation. `crit_subst` replaced the `crit_map` table — see its doc comment
+/// — so the four cases and the one `None` it can return are pinned here
+/// rather than being implied by whatever the inlining rules happen to join.
+#[test]
+fn sigma_crit_renames_a_callees_roots_onto_the_placeholder() {
+    let callee = p("P.get");
+    // `⟨G1@M3⟩`: the callee's own `⟨G1⟩` nested at the callsite `M3`.
+    let id = CritId::origin("M3");
+    let inner = CritId::origin("G1");
+
+    // A formal goes to the matching operand slot, the return to the result.
+    assert_eq!(
+        crit_subst(&callee, &id, &Base::Param(callee.clone(), 1), 4),
+        Some(Base::CritSlot(id.clone(), 1))
+    );
+    assert_eq!(
+        crit_subst(&callee, &id, &Base::Ret(callee.clone()), 4),
+        Some(Base::CritRet(id.clone()))
+    );
+
+    // Hybrid-in-hybrid: the callee's own placeholder is renamed into the
+    // holder, slots and result alike.
+    assert_eq!(
+        crit_subst(&callee, &id, &Base::CritSlot(inner.clone(), 0), 4),
+        Some(Base::CritSlot(inner.nest(&id), 0))
+    );
+    assert_eq!(
+        crit_subst(&callee, &id, &Base::CritRet(inner.clone()), 4),
+        Some(Base::CritRet(inner.nest(&id)))
+    );
+    assert_eq!(inner.nest(&id).depth(), 1, "⟨G1@M3⟩ is one callsite deep");
+
+    // The k-limit is the whole of the partiality: at `k = 0` the nested name
+    // does not exist, and the constraint mentioning it is dropped.
+    assert_eq!(crit_subst(&callee, &id, &Base::CritRet(inner.clone()), 0), None);
+    assert_eq!(crit_subst(&callee, &id, &Base::CritSlot(inner.clone(), 0), 0), None);
+    // ...but a formal or a return never depends on it.
+    assert_eq!(
+        crit_subst(&callee, &id, &Base::Ret(callee.clone()), 0),
+        Some(Base::CritRet(id.clone()))
+    );
+
+    // Outside σ's domain: another procedure's roots, and a local.
+    assert_eq!(crit_subst(&callee, &id, &Base::Param(p("Q.get"), 1), 4), None);
+    assert_eq!(crit_subst(&callee, &id, &Base::Ret(p("Q.get")), 4), None);
+    assert_eq!(crit_subst(&callee, &id, &Base::Var(Var::from("h")), 4), None);
 }
 
 // =========================================================================

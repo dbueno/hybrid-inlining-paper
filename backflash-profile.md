@@ -1084,7 +1084,13 @@ done
 
 # sequential vs. the two parallel evaluators, with the relation sizes diffed
 # between them first.  `--backend X` runs one alone, which is what to do under
-# `/usr/bin/time -l`: a peak footprint is per process.
+# `/usr/bin/time -l`: a peak footprint is per process.  `--timeout SECS` caps
+# each backend the way `ctadl_profile`'s does — between iterations, so it is
+# not a ceiling — and defaults to none, because the comparison this program
+# exists to make needs converged runs: a backend stopped at the budget has
+# derived less than one that finished, so the tool withholds the speedup and
+# labels the size diff rather than reporting a truncated run as a
+# disagreement.
 cargo run --features ctadl --release --example ctadl_parallel -- \
     backflash.apk --k 4 --repeat 3
 for t in 1 2 4 8 20; do

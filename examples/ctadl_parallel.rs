@@ -23,6 +23,17 @@
 //! less is a bug, not a result. `--backend` runs one of the three alone,
 //! which is what to do under `/usr/bin/time -l` — a peak footprint is
 //! per-process, so three fixpoints in one process report one peak.
+//!
+//! `--timeout SECS` caps each fixpoint, as `ctadl_profile` does: Ascent
+//! checks it *between* iterations, so it declines to start another rather
+//! than cutting one short, and a run can overrun its budget by a lot. There
+//! is no default — omit it and every backend runs to convergence, which is
+//! what the `k = 6` recipe in `backflash-profile.md` wants. A truncated run's
+//! relation sizes are a function of the budget, so once anything times out
+//! the agreement check and the speedups are no longer claims about the
+//! evaluators, and this program says so rather than printing them straight:
+//! `seq` timing out at 240s while `par+ir` converges is exactly the shape
+//! that would otherwise read as a derivation bug.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -49,6 +60,9 @@ fn sizes(summary: &str) -> BTreeMap<String, usize> {
 /// One backend's run: its wall times, and what it derived.
 struct Run {
     walls: Vec<Duration>,
+    /// One per repeat, in step with `walls`: did that repeat reach a
+    /// fixpoint, or did `--timeout` stop it?
+    converged: Vec<bool>,
     sizes: BTreeMap<String, usize>,
     tuples: usize,
 }
@@ -62,40 +76,66 @@ impl Run {
         v.sort_unstable();
         v[v.len() / 2]
     }
+
+    /// Did any repeat stop at the budget? One is enough to disqualify the
+    /// whole backend from being compared: the sizes come from the first
+    /// repeat and the median from all of them.
+    fn timed_out(&self) -> bool {
+        self.converged.iter().any(|c| !c)
+    }
 }
 
-fn run_backend(name: &str, prog: &Program, k: usize, repeat: usize) -> Run {
+/// `timeout` is passed straight to Ascent's generated `run_timeout`, which
+/// treats [`Duration::MAX`] as "no budget" and skips reading the clock
+/// altogether — so the no-`--timeout` path is the same code, not a branch
+/// around it.
+fn run_backend(name: &str, prog: &Program, k: usize, repeat: usize, timeout: Duration) -> Run {
     let mut walls = Vec::with_capacity(repeat);
+    let mut converged = Vec::with_capacity(repeat);
     let mut sizes_of = BTreeMap::new();
     for i in 0..repeat {
         let start = Instant::now();
-        let summary = match name {
+        let (done, summary) = match name {
             "seq" => {
                 let mut a = HybridAnalysis::for_program(prog, k);
-                a.run();
-                a.relation_sizes_summary()
+                let done = a.run_timeout(timeout);
+                (done, a.relation_sizes_summary())
             }
             "par" => {
                 let mut a = ParallelHybridAnalysis::for_program(prog, k);
-                a.run();
-                a.relation_sizes_summary()
+                let done = a.run_timeout(timeout);
+                (done, a.relation_sizes_summary())
             }
             "par+ir" => {
                 let mut a = InterRuleHybridAnalysis::for_program(prog, k);
-                a.run();
-                a.relation_sizes_summary()
+                let done = a.run_timeout(timeout);
+                (done, a.relation_sizes_summary())
             }
             other => panic!("unknown backend `{other}`"),
         };
         let wall = start.elapsed();
-        println!("  {name} run {}: {wall:?}", i + 1);
+        println!(
+            "  {name} run {}: {wall:?}{}",
+            i + 1,
+            if done { "" } else { "  (TIMED OUT)" }
+        );
         walls.push(wall);
+        converged.push(done);
         if i == 0 {
             sizes_of = sizes(&summary);
         }
+        // A repeat that hit the budget will hit it again, at the same
+        // iteration, for as many minutes as it is given. Measuring is
+        // expensive; stop rather than buy the same non-result twice.
+        if !done {
+            if i + 1 < repeat {
+                println!("  {name}: stopping after {} of {repeat} repeats (timed out)", i + 1);
+            }
+            break;
+        }
     }
     let tuples = sizes_of.values().sum();
-    Run { walls, sizes: sizes_of, tuples }
+    Run { walls, converged, sizes: sizes_of, tuples }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -104,6 +144,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut max_procs: Option<usize> = None;
     let mut repeat = 3usize;
     let mut backends: Vec<String> = Vec::new();
+    // No budget by default: `Duration::MAX` is what Ascent's generated
+    // `run_timeout` reads as "run to convergence".
+    let mut timeout = Duration::MAX;
 
     let mut opts = Options::default();
 
@@ -113,11 +156,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--k" => k = args.next().unwrap_or_default().parse()?,
             "--max-procs" => max_procs = Some(args.next().unwrap_or_default().parse()?),
             "--repeat" => repeat = args.next().unwrap_or_default().parse()?,
+            "--timeout" => {
+                timeout = Duration::from_secs(args.next().unwrap_or_default().parse()?);
+            }
             "--backend" => backends.push(args.next().unwrap_or_default()),
             "-h" | "--help" => {
                 eprintln!(
                     "usage: ctadl_parallel <import>... [--k N] [--max-procs N] \
-                     [--repeat N] [--backend seq|par|par+ir]... [--ssa] [--no-preprocess]"
+                     [--repeat N] [--timeout SECS] [--backend seq|par|par+ir]... \
+                     [--ssa] [--no-preprocess]"
                 );
                 return Ok(());
             }
@@ -154,8 +201,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::thread::available_parallelism().map_or("?".into(), |n| n.to_string())
         });
 
+    let timeout_desc = if timeout == Duration::MAX {
+        "none".to_string()
+    } else {
+        format!("{}s", timeout.as_secs())
+    };
     println!(
-        "procs={} stmts={} virtual_call={} direct_call={} k={k} repeat={repeat} threads={threads}",
+        "procs={} stmts={} virtual_call={} direct_call={} k={k} repeat={repeat} \
+         timeout={timeout_desc} threads={threads}",
         prog.procedure.len(),
         prog.in_proc.len(),
         prog.virtual_call.len(),
@@ -164,8 +217,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut runs: Vec<(String, Run)> = Vec::new();
     for name in &backends {
-        let r = run_backend(name, &prog, k, repeat);
-        println!("  {name} median: {:?}  ({} tuples)", r.median(), r.tuples);
+        let r = run_backend(name, &prog, k, repeat, timeout);
+        println!(
+            "  {name} median: {:?}  ({} tuples){}",
+            r.median(),
+            r.tuples,
+            if r.timed_out() { "  (partial: timed out)" } else { "" }
+        );
         runs.push((name.clone(), r));
     }
 
@@ -174,7 +232,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A converged run at a `k` the sequential binary has only ever timed out
     // at is the one case where this program is the only source of them.
     if let Some((name, r)) = runs.first() {
-        println!("\n=== relation sizes ({name}) ===");
+        println!(
+            "\n=== relation sizes ({name}){} ===",
+            if r.timed_out() { ", TRUNCATED — a function of the budget, not of k" } else { "" }
+        );
         for (rel, n) in &r.sizes {
             println!("{rel} size: {n}");
         }
@@ -184,10 +245,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // backend that derives less is not faster, it is wrong.
     if let Some((_, seq)) = runs.iter().find(|(n, _)| n == "seq") {
         println!("\n=== agreement with seq ===");
+        if seq.timed_out() {
+            println!(
+                "  seq stopped at the budget, so its sizes are a snapshot and \
+                 nothing below is a check on any backend"
+            );
+        }
         for (name, r) in &runs {
             if name == "seq" {
                 continue;
             }
+            // Two runs stopped at different points of the same fixpoint are
+            // expected to differ. Report the comparison anyway — the numbers
+            // are still worth seeing — but never as evidence of a bug.
+            let comparable = !seq.timed_out() && !r.timed_out();
             let mut bad = Vec::new();
             for (rel, n) in &seq.sizes {
                 if r.sizes.get(rel) != Some(n) {
@@ -200,9 +271,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             if bad.is_empty() {
-                println!("  {name}: all {} relations agree", seq.sizes.len());
-            } else {
+                println!(
+                    "  {name}: all {} relations agree{}",
+                    seq.sizes.len(),
+                    if comparable { "" } else { "  (both snapshots; agreement here is luck)" }
+                );
+            } else if comparable {
                 println!("  {name}: {} DISAGREE", bad.len());
+                for line in &bad {
+                    println!("    {line}");
+                }
+            } else {
+                println!(
+                    "  {name}: {} differ, but a truncated run is not comparable — \
+                     re-run without --timeout to check the derivation",
+                    bad.len()
+                );
                 for line in &bad {
                     println!("    {line}");
                 }
@@ -213,7 +297,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let base = seq.median().as_secs_f64();
         for (name, r) in &runs {
             let t = r.median().as_secs_f64();
-            println!("  {name:<7} {t:>8.3}s   {:.2}x", base / t);
+            // A backend that stopped at the budget did less work than one
+            // that finished, so their ratio is not a speedup. Print the time
+            // and withhold the number rather than print a flattering one.
+            if seq.timed_out() || r.timed_out() {
+                println!("  {name:<7} {t:>8.3}s   --  (timed out; not a speedup)");
+            } else {
+                println!("  {name:<7} {t:>8.3}s   {:.2}x", base / t);
+            }
         }
     }
 

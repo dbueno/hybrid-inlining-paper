@@ -744,12 +744,22 @@ ascent_source! { hybrid_rules:
 }
 
 ascent! {
+    #![generate_run_timeout]
     /// Hybrid Inlining as one stratified derivation: every procedure's hybrid
     /// summary, every pending critical statement, and every resolution, in a
     /// single fixpoint.
     ///
     /// Build one with [`HybridAnalysis::for_program`] and `run()` it, or just
     /// call [`run_hybrid`].
+    ///
+    /// `#![generate_run_timeout]` adds `run_timeout(d)`, which stops *between*
+    /// iterations once `d` has elapsed and returns `false`; it cannot cut an
+    /// iteration short. `run()` becomes `run_timeout(Duration::MAX)`, and the
+    /// generated check short-circuits on `timeout < Duration::MAX` before it
+    /// reads the clock, so an ordinary run pays a `Duration` comparison per
+    /// iteration and nothing else. `examples/ctadl_parallel.rs` is what wants
+    /// it: the same budget has to apply to all three backends, and this is
+    /// the only one of them that is not already instrumented.
     pub struct HybridAnalysis;
 
     // The EDB schema of `ir::Program`, included from the same source so the
@@ -1063,7 +1073,12 @@ pub mod parallel {
     use super::*;
 
     ascent_par! {
+        #![generate_run_timeout]
         /// Hybrid Inlining under `ascent_par!` with intra-rule parallelism.
+        ///
+        /// `run_timeout` as on [`HybridAnalysis`]: the generated check sits at
+        /// the bottom of each SCC's loop, which is a sequential point in the
+        /// parallel evaluator too, so the budget means the same thing here.
         pub struct ParallelHybridAnalysis;
 
         include_source!(crate::ir::edb);
@@ -1088,6 +1103,7 @@ pub mod parallel {
 
         ascent_par! {
             #![inter_rule_parallelism]
+            #![generate_run_timeout]
             /// Hybrid Inlining with both intra- and inter-rule parallelism.
             pub struct InterRuleHybridAnalysis;
 

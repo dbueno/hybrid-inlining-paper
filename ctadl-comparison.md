@@ -372,6 +372,17 @@ pending instances can carry a call string. That cost lands in all 1.06 M
 
 ### Index redundancy: 76–81% of retained, and half the `points` Vec is empty
 
+*The `~2×` this section originally estimated has since been measured. Every
+index Ascent generates for these rules is priced in
+`backflash-profile.md`, "The indices, priced index by index" — 133 of them over
+65 relations, checked against the generated plan — and the model reproduces the
+by-subtraction figure to the decimal (287.5 MiB at `k = 1`). The multiplier is
+**3.4× the tuple bytes**, flat at 3.2–3.7× across `k = 1..6`; row-id indices
+over one shared store would take the whole run **2.5×** smaller and a pure
+row-id scheme **3.7×**, against a 4.4× floor. At `k = 6` that is 10.4 GiB down
+to 3.6. Read the estimate below as an
+estimate and that as the number.*
+
 ```
   this engine, k = 1        tuple Vecs 347.3 MiB (24%)   indices 1.1 GiB   (76%)
   this engine, k = 0        tuple Vecs  56.4 MiB (19%)   indices 237.9 MiB (81%)
@@ -569,6 +580,101 @@ This is item 5 of `backflash-profile.md`'s "what is left to try" — "merging
 instances whose decisive slot has the same points-to set" — and CTADL is a
 worked example of it.
 
+## The `k` sweep says the same thing from the other side
+
+`backflash-profile.md` now has the whole program converged at every `k` from 1
+to 6 under `par+ir`, which is the sweep this comparison did not have when it
+was written. It bears on CTADL in three ways.
+
+```
+  k                        1         2         3         4         5          6
+  pending (instances)    966     2,040     4,680    12,576    41,605    164,693
+  resolve              1,527     3,914    11,262    40,126   169,339    777,279
+  top / pending         0.58      0.63      0.66      0.73      0.82       0.90
+  all tuples / pending   542       313       187       126       102        100
+  peak GiB              0.43      0.49      0.71      1.23      3.51      12.74
+  B / tuple              879       829       874       838       887        831
+```
+
+**Everything is a constant times `pending`, and `pending` fits `k^5.07`.** From
+`k = 3` up the closure carried per instance stops falling: about 100 tuples per
+instance, at a flat ~850 bytes each. So on this app the memory cost of hybrid
+inlining is, quite literally, the size of the instance space times two
+constants — and the instance space is the one thing CTADL does not have. Its
+`resolvent` is a lattice whose call-string column joins rather than multiplies,
+so distinct strings reaching the same key collapse to one; there is no `k^5` to
+bound because there is no `2^d` to cut off. This document's section "Why CTADL
+has no `k` and does not need one" argues that structurally; the sweep prices
+it. At `k = 6` this engine holds 164,693 instances and 777,279 `resolve`
+tuples where CTADL's entire context-sensitive layer on the same app is 217
+tuples and its `resolvent` is 17.
+
+**The instances bought at the top of the range are the ones that fall back to
+CHA anyway.** `top/pending` climbs from 0.58 to 0.90: nine in ten instances at
+`k = 6` are ⊤-summarised, which is exactly the class-hierarchy answer CTADL
+gets for free and gets 40 findings out of. 12.7 GiB and 11 minutes to mint
+164,693 obligations of which 148,518 are discharged by giving up is the
+strongest argument in either document for item 5 of `backflash-profile.md`.
+
+**Bytes per tuple do not move, and instructions per tuple move enormously.**
+879 B/tuple at `k = 1` and 831 at `k = 6`, against 29K instructions per derived
+tuple at `k = 1` and 7,906K at `k = 6` — 268×. The memory half of this
+document's diagnosis therefore scales the way it says it does: tuple width and
+index redundancy are constants, and raising `k` multiplies the tuple count they
+apply to. The *time* half does not. Nothing in this comparison, or in
+`backflash-profile.md`, currently explains where those instructions go.
+
+## Open questions, against CTADL
+
+Five, in the order the numbers argue for. All of them are comparisons this
+document is set up to make and has not made.
+
+1. **What would a lattice-valued context column cost here?** CTADL's
+   `resolvent(FunctionId, FormalIndex, Path, CallTargetObject,
+   SmallestCallString)` makes the call string a lattice value, so four columns
+   functionally determine at most one string. `pending(Proc, CritId)` here is
+   one tuple *per string*. The structural difference is understood; what is not
+   measured is what it would cost in **precision** on this app — how many of
+   the 1,527 `resolve` tuples at `k = 1` survive if instances whose decisive
+   slot has the same points-to set are merged. `examples/dispatch_diff.rs`
+   already knows how to compare two dispatch sets across a representation
+   change, so this is a day's work and it is the only item here that could
+   remove the `k^5`.
+
+2. **Does raising `k` past 3 buy a single finding?** The whole `k` sweep is
+   measured in tuples, bytes and dispatch edges, never in answers. CTADL's own
+   comparison is stark — `mixed` (CHA) 40 findings, `hi` 8 — and `top/pending`
+   climbing to 0.90 says most of what `k` buys here is ⊤. Run the same
+   source/sink model against this engine's `k = 1..6` and report findings, not
+   `resolve` tuples. If the curve is flat past `k = 2`, items 5 and 8 of
+   `backflash-profile.md` stop being performance work and become dead-code
+   removal.
+
+3. **Where do the instructions go?** 3,300 instructions per tuple for CTADL at
+   index time against 8,500 here at `k = 0` was the original ~2.6× and was
+   attributed to tuple width and content hashing. That constant cannot explain
+   29K → 7,906K across the `k` sweep. Two candidates, unseparated: redundant
+   derivation (86 rules in stratum B, each probing an index for a tuple that
+   already exists) and probes that get more expensive with `k` (a `CritId`
+   hashes `k + 1` un-interned dex statement labels). Only the second is
+   comparable to CTADL, and only the first is likely to be the answer.
+
+4. **Is CTADL's `assign_like`/`locals` really the same relation as `points`?**
+   The "First" section above shows `points` at 69,881 against `locals` at
+   54,880–69,731 and concludes the two engines are now the same size on it.
+   That was `k = 1`. At `k = 6` `points` is 6,578,767 — 94× more — and `locals`
+   is unchanged, because CTADL has no `k`. The claim "on the relation this
+   section is about, the two engines are now the same size" is true at `k = 1`
+   and false everywhere else, and the honest version needs the `k` at which it
+   is being made.
+
+5. **Is 2.5× from row-id indices additive with interning, or does it overlap?**
+   Item 1 shrinks the tuple; item 4 stops copying it. The floor computed in
+   `backflash-profile.md` assumes they compose — 373 MiB → ~102 MiB from
+   row-ids alone, and the `Vec` that remains is what interning attacks — but no
+   run has both. CTADL has both, which is why its 24-byte tuple and its 1.7×
+   BYODS saving read as small numbers on its side and large ones on this.
+
 ## Summary: where the 75× went, and where the remaining 19× goes
 
 On the core derived relations, `k = 1` against `ctadl --strategy hi`:
@@ -578,7 +684,7 @@ On the core derived relations, `k = 1` against `ctadl --strategy hi`:
 | context machinery | **4.7×** | **1.24×** | `k = 0` → `k = 1`; placeholders in 89% of `points`, 21% after | **done** — it was mostly merged variable versions, not context |
 | tuples at equal context | **2.0×** | **1.75×** | eager value closure vs. deferred to query | architectural |
 | tuple width | **~4×** | ~4× | 144 B vs 24 B — no symbol interner, 48-byte `Base` | yes, and it is the cheapest win |
-| index redundancy | **~2×** | ~2× | Ascent `HashMap<K,Vec<V>>` per pattern vs. one BYODS store | yes — CTADL measures this at 1.7× |
+| index redundancy | **~2×** | **2.5×, measured** | Ascent `HashMap<K,Vec<V>>` per pattern vs. one BYODS store | yes — and it is worth more here than the 1.7× CTADL measured |
 
 Originally 4.7 x 2.0 x 4 x 2 = 75, against ~75x observed (1.39 GiB of
 `points`/`edge`/`pub_points`/`used_ext`/`root_map`/`pub_root` against CTADL's
@@ -621,8 +727,18 @@ gap: 144-byte tuples of un-interned `Arc<str>`, indexed six times over.
 3. **`shrink_to_fit` the relations after the fixpoint.** ~142 MiB at `k = 1`
    as originally measured, ~25 MiB once item 0 is the default. Free either way,
    but it is a small win now, not a large one.
-4. **Then** consider BYODS. It is worth 1.7–2.3× by CTADL's own measurement,
-   and it is much more work than 1–3.
+4. **Then** consider BYODS. CTADL measured *its own* store at 1.7–2.3×; here
+   it is worth **2.5×, or 3.7× for a pure row-id scheme** — priced index by
+   index in `backflash-profile.md`, "If each rule stored one copy of the
+   relation data". It is worth more here than it was there for the same reason
+   everything else in this document is: at 24 bytes a copied tuple is cheap and
+   the key half of each index dominates, at 144 bytes it is not. It is still
+   much more work than 1–3, and it composes with 1 rather than competing —
+   interning shrinks the one copy that a row-id scheme is a floor on, so the
+   two together are worth far more than either. Note also that `ids` (values
+   become `u32` row ids, keys still materialised) is 2.5× of the 3.7× and needs
+   no new lookup path: `HashMap<K, Vec<u32>>` is the same map with a narrower
+   value.
 
 And one that is not about memory at all: **keep `rets[1]`**. Exception flow is
 two extra `bind_ret`/`ret` facts per call in a schema that already has both
@@ -664,6 +780,10 @@ done
 
 # what the million points tuples actually contain
 cargo run --features ctadl --release --example ptval_split -- backflash.apk --k 1
+
+# every index Ascent generates, priced, against a shared-store counterfactual.
+# This is where the "index redundancy" row of the summary table comes from.
+cargo run --features ctadl --release --example index_cost -- backflash.apk --k 1
 ```
 
 Two files are new. `examples/ptval_split.rs` runs the ordinary

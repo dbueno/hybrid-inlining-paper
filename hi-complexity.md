@@ -183,7 +183,20 @@ it does contain it. The same programs with `k` held at 3:
 ```
 
 Flat past `d = k`, and everything else with it. **The k-limit is the only
-thing standing between this analysis and an exponential.** The one other brake
+thing standing between this analysis and an exponential.**
+
+> **Confirmed on a real program.** `backflash-profile.md` now converges the
+> whole of `backflash.apk` at every `k` from 1 to 6. `pending` goes 966 →
+> 164,693, fitting `k^5.07` over `k = 3..6`, and **every other relation is a
+> constant times it**: from `k = 3` up, `points` is 35–40 tuples per instance,
+> `edge` 31–36 and the whole fixpoint 100–125 tuples per instance, all flat, at
+> a flat ~850 bytes each. The families predicted that the `CritId`-keyed
+> relations inherit `pending`'s growth; on a real app *everything* does, and
+> the fixpoint's size is the instance space times two constants. `ctadl-
+> comparison.md` prices the alternative: CTADL makes the call string a lattice
+> column, so distinct strings reaching the same key join instead of
+> multiplying, and its whole context-sensitive layer on the same app is 217
+> tuples. The one other brake
 in the rules — the `blocked` guard on propagation, below — prunes placeholders
 that are already *decided*, and `branching(d)`'s are not: its receiver comes
 from the top, so every intermediate holder is genuinely blocked and every one

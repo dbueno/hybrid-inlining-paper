@@ -72,7 +72,7 @@ make the closure infinite, and the clock is the only thing that stops it.
 `src/path_bound.rs` sets out the argument. This document measures what the
 analysis does on the app now that the bound is in place.
 
-Everything below comes from three binaries:
+Everything below comes from four binaries:
 
 - `examples/ctadl_profile.rs` — the same rules as `HybridAnalysis`, from the
   same `hybrid_rules` source, under Ascent's `#![measure_rule_times]`. Rule
@@ -82,6 +82,9 @@ Everything below comes from three binaries:
 - `examples/ctadl_parallel.rs` — the same rules under all three of Ascent's
   evaluators, on one import, with the relation sizes diffed between them.
   Wall time, and what it takes to beat the sequential one.
+- `examples/index_cost.rs` — every index Ascent generates for these rules,
+  priced from the generated storage rather than by subtracting from the
+  allocator, plus what one shared store would cost instead.
 
 The commands for all three are at the end; the short one is at the top.
 
@@ -468,6 +471,178 @@ Three things worth keeping:
   the whole story; at `k = 8` the tuples are numerous enough that the index
   arithmetic stops mattering, which is the next section.
 
+### The indices, priced index by index
+
+"78% by subtraction" was as far as `ctadl_memory` could see: Ascent's index
+fields are private, so the allocator's retained total less the tuple `Vec`s and
+the `Arc` payloads was the only handle on them. `examples/index_cost.rs`
+computes the same quantity from the other end, by modelling what Ascent 0.8
+generates:
+
+- `ascent_hir.rs:249` gives **every** relation a full index,
+  `RelFullIndexType<Tuple, ()> = HashMap<Tuple, ()>`, for insert-time dedup.
+  Its key is the whole tuple, so it is a complete second copy of the relation.
+- every binding pattern the rules join on gets a
+  `ToRelIndexType<K, V> = HashMap<K, Vec<V>>` where `V` is the **non-key columns
+  stored inline** (`IndexValType::Direct`, `ascent_hir.rs:191-198`). Key plus
+  value is the whole tuple again, so each of those is another full copy, split
+  in two.
+- the `indices_none` pattern is that with an empty key: one `Vec` holding every
+  tuple of the relation, verbatim.
+- every per-key `Vec<V>` is born `Vec::with_capacity(4)`
+  (`internal.rs`, `index_insert`), so a pattern whose keys are nearly unique
+  pays four value slots to store one value.
+
+That is 133 indices over 65 relations, and the binary checks its inventory
+against `HybridAnalysis::summary()` — the generated plan — before pricing
+anything, so a rule edit that adds a binding pattern cannot go unpriced. At
+`k = 1`:
+
+```sh
+cargo run --features ctadl --release --example index_cost -- backflash.apk --k 1
+```
+
+```
+  relation        tuples        Vec  indices now  copies       ids     ideal
+  edge            138,217   36.0 MiB    140.0 MiB     3.9  31.1 MiB   6.1 MiB
+  points           69,881   18.0 MiB     68.2 MiB     3.8   9.1 MiB   2.3 MiB
+  used_ext         75,012   14.0 MiB     21.3 MiB     1.5   4.4 MiB   1.3 MiB
+  in_proc          41,143    2.5 MiB     11.4 MiB     4.6   3.8 MiB   1.4 MiB
+  root_map         22,066    3.5 MiB     10.4 MiB     3.0   3.3 MiB 662.2 KiB
+  mov              38,018    3.0 MiB      6.9 MiB     2.3   1.9 MiB 884.5 KiB
+  actual_arg       14,858  640.0 KiB      5.1 MiB     8.2   2.7 MiB 900.1 KiB
+  -- total        523,540   85.4 MiB    287.5 MiB     3.4  64.1 MiB  16.6 MiB
+```
+
+**The model lands on 287.5 MiB of indices, which is the by-subtraction figure
+to the decimal**, and the two accountings reconcile term by term rather than
+merely landing near each other:
+
+```
+  model, whole store                                373.0 MiB
+    less the EDB tuple Vecs (85.4 - 76.5)            -8.9      seeded before run()
+    plus the Arc payloads the model does not price   +2.7      suffixes, call strings
+  = mem::report retained                            366.8 MiB
+```
+
+`mem::report`'s own split of that 366.8 is 76.5 MiB of IDB `Vec`s, 2.7 MiB of
+`Arc` payloads and 287.5 MiB of "indices, by subtraction". Neither number is
+the other's ground truth — the model does not see the delta/new copies
+semi-naive keeps, and the allocator cannot see inside a private field — so the
+agreement is a result, not a definition. What follows can be read off the
+model.
+
+The individual indices say it more sharply than the totals:
+
+```
+  index         pattern   tuples      keys      bytes     ideal  values/key
+  edge            0_1_2   138,217   138,217   36.2 MiB   1.2 MiB        1.0
+  edge             none   138,217         1   36.0 MiB 540.0 KiB  138,217.0
+  edge              0_2   138,217    88,690   35.8 MiB   2.2 MiB        1.6
+  edge              0_1   138,217    72,422   32.0 MiB   2.2 MiB        1.9
+  points            0_1    69,881    53,327   19.8 MiB   1.1 MiB        1.3
+  points          0_1_2    69,881    69,881   18.1 MiB 640.0 KiB        1.0
+  points           none    69,881         1   18.0 MiB 273.0 KiB   69,881.0
+  used_ext      0_1_2_3    75,012    75,012   14.1 MiB 640.0 KiB        1.0
+  points              0    69,881     2,375   12.2 MiB 325.0 KiB       29.4
+```
+
+`edge` is 36.0 MiB of tuples and 140.0 MiB of index — **the relation is stored
+five times over**, once as itself and four times as a key/value split of
+itself. `edge_indices_none` is the plainest case: a single-key map whose one
+`Vec` holds all 138,217 tuples, an exact duplicate of `edge` itself, and it is
+there because some rule scans `edge` with nothing bound.
+
+Two structural readings, both of which generalise past this app:
+
+- **A relation with nearly-unique keys pays the most.** `edge_indices_0_1_2`,
+  `points_indices_0_1_2` and `used_ext_indices_0_1_2_3` are full indices with
+  exactly one value per key, and they are the largest single item for their
+  relation. `points_indices_0` has 29.4 values per key and costs 12.2 MiB for
+  the same 69,881 tuples that `points_indices_0_1` spends 19.8 MiB on. Ascent's
+  `with_capacity(4)` is why: at 1.3 values per key, three quarters of the value
+  slots in `points_indices_0_1` are empty.
+- **The multiplier is a property of the schema, not of the run.** It is 3.4× at
+  `k = 1`, 3.7× at `k = 2` and `k = 3`, 3.6× at `k = 4` and 3.3× at `k = 5`.
+  Nothing about raising `k` changes how many times a tuple is copied.
+
+### If each rule stored one copy of the relation data
+
+The counterfactual the table's last two columns price. `ids` is the realistic
+one: an index stores a 4-byte **row id** into the relation's own `Vec` instead
+of a copy of the non-key columns, and the full index becomes a table of row ids
+hashed by the tuple they point at — the shape CTADL's `#[ds(locals_trie)]`
+BYODS store has, and item 4 of `ctadl-comparison.md`. `ideal` is the lower
+bound: one copy of the data and every index a pure row-id structure, keys
+reached through the store rather than materialised in it.
+
+```
+  k = 1     now        373.0 MiB  =   85.4 MiB Vec + 287.5 MiB indices
+            row ids    149.5 MiB  =   85.4 MiB Vec +  64.1 MiB indices   2.5x
+            ideal      102.1 MiB  =   85.4 MiB Vec +  16.6 MiB indices   3.7x
+
+  k = 5     now          3.0 GiB  =  717.3 MiB Vec +   2.3 GiB indices
+            row ids    992.1 MiB  =  717.3 MiB Vec + 274.8 MiB indices   3.1x
+            ideal      812.8 MiB  =  717.3 MiB Vec +  95.6 MiB indices   3.8x
+
+  k = 6     now         11.1 GiB  =    2.7 GiB Vec +   8.5 GiB indices
+            row ids      3.6 GiB  =    2.7 GiB Vec + 931.2 MiB indices   3.1x
+            ideal        3.0 GiB  =    2.7 GiB Vec + 352.8 MiB indices   3.7x
+```
+
+At `k = 6` the same list is five separate 1.1 GiB items, four of them copies
+of the same two relations:
+
+```
+  index         pattern     tuples       keys      bytes     ideal  values/key
+  edge            0_1_2  5,439,654  5,439,654    1.1 GiB  40.0 MiB         1.0
+  points          0_1_2  6,578,767  6,578,767    1.1 GiB  40.0 MiB         1.0
+  edge             none  5,439,654          1    1.1 GiB  20.8 MiB   5,439,654
+  points           none  6,578,767          1    1.1 GiB  25.1 MiB   6,578,767
+  points              0  6,578,767      2,375    1.1 GiB  25.1 MiB     2,770.0
+  points            0_1  6,578,767  1,303,770  757.8 MiB  51.1 MiB         5.0
+  edge              0_1  5,439,654  1,185,611  696.6 MiB  46.8 MiB         4.6
+  edge              0_2  5,439,654    371,025  551.4 MiB  27.3 MiB        14.7
+```
+
+`points` and `edge` between them are 7.6 GiB of the 11.1: 2.2 GiB of tuples and
+5.4 GiB of copies of those tuples. `points_indices_0` is the extreme case —
+2,375 keys, one per procedure, 2,770 values each, and 1.1 GiB spent on it
+because the value stored is the other two columns of `points` rather than a
+row number.
+
+The `k = 6` row is the model's own out-of-sample check: 11.1 GiB modelled
+against the sequential run's measured 10.38 GiB peak, on a run 31× larger than
+the `k = 1` one the model was reconciled against. It is the row that matters
+practically, too — **row-id indices would put the `k = 6` fixpoint in 3.6 GiB
+instead of 10.4**, which is the difference between a run that needs a big
+machine and one that does not.
+
+**2.5× to 3.7×, at every `k` measured, and the ceiling is 4.4×** — that is what the tuple `Vec`s
+alone would cost, so no amount of index sharing can do better than take the
+run to 23% of what it is now. `ideal` gets to 27%, which means an index scheme
+that stores nothing but row ids has essentially reached the floor and the
+remaining question is the width of a tuple, not the number of copies of it.
+
+Three things worth knowing before reaching for it:
+
+- **`ids` is most of the win and is much the smaller change.** Keeping keys
+  materialised in the tables costs 47.5 MiB of the 64.1 MiB that the `ids`
+  column spends at `k = 1`, and buys back 2.5× of 3.7×. What it does *not*
+  need is a new hash-lookup path: `HashMap<K, Vec<u32>>` is the same map with
+  a narrower value.
+- **It composes with interning rather than competing with it.** Item 1 of
+  `ctadl-comparison.md` — `u32` symbol ids, a 144-byte `points`/`edge` tuple
+  down to something like 40 — shrinks the `Vec` that `ideal` is a floor on.
+  The two together would put this run on the order of 40 MiB against today's
+  373; either alone is about 3×.
+- **CTADL measured its own version of this at 1.7×, not 3.7×**
+  (`assign_like store estimate: trie 13.9 MB … default equiv ~23.9 MB`). The
+  difference is tuple width: at 24 bytes a copy is cheap and the key half of
+  each index dominates; at 144 it is not. The lever is worth roughly twice as
+  much here as it was there, for the same reason everything else in
+  `ctadl-comparison.md` is worth more here.
+
 ## How it grows with the program
 
 `--max-procs N` keeps the N procedures with the most statements:
@@ -505,9 +680,11 @@ fixpoint grow with `k`?* can only be asked of runs that reach one.
 Until the front end started preprocessing, those were two different
 experiments, because nothing past `k = 2` converged at full size. They are now
 nearly the same experiment: **`k = 1` through `k = 5` all converge on the whole
-program**, where before the ceiling was `k = 2`.
+program inside a 240s budget**, where before the ceiling was `k = 2` — and
+`k = 6` converges too, in 647s under `par+ir`, which is what the converged
+sweep two subsections down is measured on.
 
-### On the whole program, the ceiling moved from `k = 2` to `k = 5`
+### On the whole program, the ceiling moved from `k = 2` to `k = 6`
 
 `--timeout 240` under a 64 GiB cap, peaks from `/usr/bin/time -l`:
 
@@ -559,6 +736,127 @@ it" below, which also compares that snapshot against the fixpoint it was 19%
 of the way to. The ceiling in this heading is a ceiling on *patience*, not on
 the analysis. `k = 7` and `k = 8` are still open.
 
+### The converged sweep, `k = 1` through `k = 6`
+
+The table above is what `ctadl_profile` reaches inside a 240s budget. Run the
+same `k` under `par+ir` with no budget and every one of them converges, which
+is what the rest of this section is measured on — one run each, `--repeat 1`,
+under a 100 GiB cap, peaks from `/usr/bin/time -l`:
+
+```sh
+for k in 1 2 3 4 5 6; do
+    ./scripts/memguard.sh 100 /usr/bin/time -l \
+        ./target/release/examples/ctadl_parallel backflash.apk \
+        --k $k --repeat 1 --backend par+ir
+done
+```
+
+```
+  k                        1         2         3         4         5          6
+  wall (par+ir)        0.91s     1.01s     1.50s     3.19s    29.34s     647.0s
+  peak GiB              0.43      0.49      0.71      1.23      3.51      12.74
+  instructions (G)        15        19        34       224     4,823    130,108
+  tuples, all rels      524K      639K      875K     1.58M     4.25M     16.5M
+  pending                966     2,040     4,680    12,576    41,605    164,693
+  points              69,881   100,151   178,644   440,600 1,513,424  6,578,767
+  edge               138,217   174,115   240,067   450,570 1,299,387  5,439,654
+  used_ext            75,012   100,697   135,906   209,704   393,139  1,026,181
+  resolve              1,527     3,914    11,262    40,126   169,339    777,279
+  pub_root            10,217    13,318    20,770    42,439   121,167    455,695
+  pub_points           4,350    10,557    24,738    54,217   128,738    371,848
+  crit_operand         2,025     4,052     8,864    22,637    72,336    283,776
+  top                    556     1,280     3,084     9,126    34,240    148,518
+```
+
+`k = 1..5` agree with the converged columns of the `ctadl_profile` table above
+relation for relation, which is the check that changing the evaluator changed
+nothing; `k = 6` is the run "`k = 6` converges" below reports, re-measured here
+at 647.0s against that section's 647.6s.
+
+**Everything grows, and everything grows at the rate of the instance space.**
+Fitting `k = 3..6`:
+
+```
+  pending        k^5.07      settled     k^5.52      points     k^5.12
+  top            k^5.53      blocked     k^5.33      edge       k^4.40
+  stuck          k^5.24      resolve     k^6.05      used_ext   k^2.83
+  crit_operand   k^4.93      pub_root    k^4.37      all tuples k^4.13
+```
+
+That is a completely different regime from the 80-procedure sweep below, where
+tuples fit `k^0.65`. The two are consistent — `k` doubles call strings only
+where there are call sites to double them, and 2,375 procedures have far more
+of them than 80 do — but on the size that matters the growth in `k` is `k^4`,
+not `k^0.65`, and the 80-procedure fit should not be read as this app's.
+
+### What grows is `pending`; everything else is a constant times it
+
+Divide each row by `pending` and the table stops moving:
+
+```
+  k                          1         2         3         4         5         6
+  pending (instances)      966     2,040     4,680    12,576    41,605   164,693
+  points   / pending      72.3      49.1      38.2      35.0      36.4      39.9
+  edge     / pending     143.1      85.4      51.3      35.8      31.2      33.0
+  pub_root / pending      10.6       6.5       4.4       3.4       2.9       2.8
+  resolve  / pending      1.58      1.92      2.41      3.19      4.07      4.72
+  top      / pending      0.58      0.63      0.66      0.73      0.82      0.90
+  all tuples / pending   542.0     313.3     187.1     125.6     102.1      99.9
+```
+
+**From `k = 3` up, the closure carried per instance is flat.** `points` is 35–40
+tuples per pending instance, `edge` 31–36, the whole fixpoint about 100–125.
+The 31× growth in tuples from `k = 1` to `k = 6` is 170× more instances against
+a per-instance cost that *fell* by 5.4×, and past `k = 3` the fall has stopped.
+So the answer to "what grows so much" is not a relation. It is `pending`, and
+`points`, `edge` and the rest are riding it at a fixed rate.
+
+Two rows do climb per instance, and they are the two that say why the run gets
+harder rather than just bigger: `resolve/pending` triples over the range and
+`top/pending` rises 0.58 → 0.90. Deeper call strings mint instances that are
+*less* decided — nine in ten instances at `k = 6` end ⊤-summarised, against
+six in ten at `k = 1` — while each one dispatches to more callees. Raising `k`
+past 3 on this app is buying instances that mostly fall back to the CHA answer.
+
+### Bytes track tuples exactly; instructions do not
+
+```
+  k                       1         2         3         4         5         6
+  B/tuple (peak)        879       829       874       838       887       831
+  instructions/tuple    29K       29K       39K      142K    1,136K    7,906K
+  µs/tuple (wall)       1.7       1.6       1.7       2.0       6.9      39.3
+```
+
+**Bytes per tuple is flat to within 7% across a 31× range in tuples and a 30×
+range in peak.** Memory on this app is *pure relation growth*: nothing about
+raising `k` makes a tuple more expensive to store, and the index multiplier
+priced in "The indices, priced index by index" above is flat too (3.2–3.7×
+at every `k` measured). If the memory footprint is the problem, the tuple count
+is the whole of it.
+
+**Instructions per derived tuple rise 268×** over the same range, and 7× in the
+single step from `k = 5` to `k = 6`. That is not relation growth by any
+reading: the run is doing vastly more work per tuple it keeps. Two candidates,
+neither of them isolated yet, and this is the open question of the section:
+
+- **Redundant derivation.** Semi-naive hands each of stratum B's 86 rules a
+  delta every round, and a candidate tuple that already exists costs a full
+  index probe before the full index rejects it. If the number of *derivations*
+  grows faster than the number of distinct tuples — which is what a fan-out
+  growing with `pending` would do — the ratio above is exactly what it looks
+  like.
+- **Probes that get more expensive with `k`.** A `CritId` is a `Stmt` plus an
+  `Arc<[Stmt]>` call string of length up to `k`, every column is
+  `#[derive(Hash)]` over `Arc<str>`, and there is no interner
+  (`ctadl-comparison.md`, "the same story in time"). So an index probe on a
+  `CritId`-keyed relation hashes the *contents* of up to `k + 1` dex statement
+  labels. That is linear in `k`, though — a 6× factor over this range, not a
+  268× one.
+
+The first is much the larger candidate and it is measurable: build under
+`--features profile`, take the per-rule times at `k = 5` and `k = 6`, and
+compare a rule's time against the tuples it added. Nothing here does that yet.
+
 ### At 80 procedures, every `k` converges — and now barely grows
 
 80 procedures is where the earlier sweep found the ceiling — the largest
@@ -608,9 +906,16 @@ the instance space, which the whole-program table above already showed is
 unchanged. Everything that *did* fall is closure carried on top of it.
 
 So the old fit's headline, "the growth is polynomial in `k`, not exponential",
-survives and gets stronger: on this app the polynomial in `k` is now roughly
+survives and gets stronger: at *this size* the polynomial in `k` is now roughly
 `k^0.65` in tuples. The exponent that hybrid inlining itself is responsible for
 — `pub_root ~ k^1.35` — was never the one doing the damage.
+
+**Do not read `k^0.65` as this app's exponent.** It is 80 procedures'. The
+converged whole-program sweep two subsections up fits `k^4.13` in tuples and
+`k^5.07` in `pending`, on the same rules and the same `k` range, because a
+2,375-procedure call graph has call sites to double where an 80-procedure cut
+has run out of them. Both fits are right about their own size; the whole
+program is the one a run is going to be asked for.
 
 The call-string space *is* exponential in `k` in principle — that is what
 `tests/scaling.rs::call_strings_double_per_level_unless_k_caps_them` pins down —
@@ -932,7 +1237,14 @@ In the order the numbers argue for:
    4-6× multiplier on everything above rather than something that gets worse,
    and with the tuple counts down by 40× it is now the largest thing left by a
    wide margin. It is the largest absolute lever left, and it is unrelated
-   to `k`. Fewer binding patterns over `points` is the lever; note that item 1
+   to `k`. *No longer a subtraction*: "The indices, priced index by index"
+   above prices all 133 of them and lands on the by-subtraction number to the
+   decimal, so the lever now has a size. **Row-id indices over one shared
+   store are worth 2.5×, a pure row-id scheme 3.7×, and the floor — indices
+   free — is 4.4×.** `edge` alone is stored five times over, once as itself and
+   four times as a key/value split of itself, and `edge_indices_none` is a
+   verbatim duplicate of the whole relation under a single key. Fewer binding
+   patterns over `points` is still a lever and a cheaper one; note that item 1
    *raised* this share, because it removed tuples and their comparatively
    cheap index set while adding an index on `points` that the two inlining
    rules now need.
@@ -958,20 +1270,28 @@ In the order the numbers argue for:
    some caller can actually reach, is the precision-side attack on the same
    growth.
 
-5. **Bound the instance space.** *Now the most interesting item on the list.*
-   `k` is the only thing limiting it, and item 0 did not touch it: `pending` is
-   within a few percent of what it always was at every `k`, and `pub_root` and
-   `pub_points` grow with unchanged exponents. Everything else got 40× smaller
-   around it. On a program that converges `k` limits the fixpoint
-   *polynomially* — now `k^0.65` in tuples, not the `k^2.5` measured before —
-   and the whole program reaches a fixpoint out to `k = 6` — `k = 6` in 2553s
-   sequentially and 648s under `par+ir`, which is 43 minutes and 11, not a
-   wall. `k = 7` has never been run to convergence and `k = 8` is still killed
-   at a 64 GiB cap before it reports anything. If `k > 2` is wanted at full
-   size, the instances need a
-   second bound: merging instances whose decisive slot has the same points-to
-   set, or a tighter `blocked`, since `blocked` is what decides whether an
-   instance is copied into its callers at all.
+5. **Bound the instance space.** *The item the converged `k = 1..6` sweep
+   promotes to first place.* `k` is the only thing limiting it, and item 0 did
+   not touch it: `pending` is within a few percent of what it always was at
+   every `k`, and `pub_root` and `pub_points` grow with unchanged exponents.
+   Everything else got 40× smaller around it. On the whole program `pending`
+   fits `k^5.07` over `k = 3..6` — 966 instances to 164,693 — and **every other
+   relation is a constant times it**: from `k = 3` up, `points` is 35–40 tuples
+   per instance, `edge` 31–36 and the whole fixpoint 100–125, all flat. Bytes
+   per tuple are flat too, so the memory footprint of a run at this size is
+   `pending` times two constants and nothing else. (The `k^0.65` fit below is
+   the 80-procedure cut, where the call graph runs out of sites to double; it
+   is not the whole-program regime.) Worse, the instances bought at the top of
+   the range are the least useful ones: `top/pending` climbs 0.58 → 0.90, so
+   nine in ten instances at `k = 6` end ⊤-summarised — falling back to exactly
+   the CHA answer — while `resolve/pending` triples. The whole program does
+   reach a fixpoint out to `k = 6` (2553s sequentially, 647s under `par+ir`),
+   `k = 7` has never been run to convergence, and `k = 8` is still killed at a
+   64 GiB cap before it reports anything. If `k > 3` is wanted at full size the
+   instances need a second bound: merging instances whose decisive slot has the
+   same points-to set — which is what CTADL's lattice-valued `resolvent` column
+   does, see `ctadl-comparison.md` — or a tighter `blocked`, since `blocked` is
+   what decides whether an instance is copied into its callers at all.
 
 6. **Sweep precision against the bound.** The vocabulary is syntactic, so there
    is no depth knob to turn; but `path_bound.rs` decides how far it follows
@@ -989,7 +1309,20 @@ In the order the numbers argue for:
    machine). And it buys throughput only — the instance space is untouched, so
    item 5 is unaffected by it.
 
-8. **Type-filtering congruence** — rejecting an extension whose accessor is not
+8. **Find out where the instructions go above `k = 4`.** *The open question
+   this document now has no answer to.* Bytes per tuple are flat across the
+   whole converged sweep and the index multiplier is flat with them, so the
+   memory story is entirely "how many tuples"; instructions per derived tuple
+   rise 268× over the same range, and 7× in the step from `k = 5` to `k = 6`
+   alone. Something is doing far more work per tuple it keeps, and nothing here
+   separates redundant derivation (each of 86 rules probing an index for a
+   tuple that already exists) from probes that get more expensive with `k` (a
+   `CritId` hashes `k + 1` un-interned dex statement labels). The first is the
+   larger candidate and the measurement is cheap: per-rule times under
+   `--features profile` at `k = 5` and `k = 6`, against the tuples each rule
+   added. See "Bytes track tuples exactly; instructions do not".
+
+9. **Type-filtering congruence** — rejecting an extension whose accessor is not
    a field of the static type reached so far. 3.8% of paths repeat an accessor,
    against 1.8% before, so there is slightly more fiction to remove than there
    was; but congruence is now the largest group of rule time (32%, against
@@ -1107,6 +1440,20 @@ for b in par+ir seq; do
         ./target/release/examples/ctadl_parallel backflash.apk --k 6 --repeat 1 --backend $b
 done
 
+# every index Ascent generates, priced, and the two counterfactuals.  The
+# inventory is checked against the generated plan before anything is priced.
+cargo run --features ctadl --release --example index_cost -- backflash.apk --k 1
+
+# the converged whole-program sweep this document's k tables are drawn from.
+# par+ir with no --timeout: every k from 1 to 6 reaches a fixpoint, k = 6 in
+# 647s.  Sequentially k = 6 is 2553s and k = 7 has never been run at all.
+cargo build --features ctadl --release --example ctadl_parallel
+for k in 1 2 3 4 5 6; do
+    ./scripts/memguard.sh 100 /usr/bin/time -l \
+        ./target/release/examples/ctadl_parallel backflash.apk \
+            --k $k --repeat 1 --backend par+ir
+done
+
 # the same run with the front end's IR passes off, which is the configuration
 # every number in this document was taken under before them
 ./scripts/memguard.sh 64 /usr/bin/time -l \
@@ -1121,6 +1468,10 @@ for k in 1 2 3 4 5 6 7 8; do
         backflash.apk --k $k --max-procs 80 --no-whole
 done
 ```
+
+Raw logs for the converged `k = 1..6` sweep are in
+`/Volumes/Shampoo/hi-parir-ksweep/` and for the index model in
+`/Volumes/Shampoo/hi-index-cost/`.
 
 `--max-procs N` keeps the N procedures with the most statements and the facts
 that mention only those; type-level facts (`lookup`, `direct_subtype`,

@@ -72,15 +72,18 @@ make the closure infinite, and the clock is the only thing that stops it.
 `src/path_bound.rs` sets out the argument. This document measures what the
 analysis does on the app now that the bound is in place.
 
-Everything below comes from two binaries:
+Everything below comes from three binaries:
 
 - `examples/ctadl_profile.rs` — the same rules as `HybridAnalysis`, from the
   same `hybrid_rules` source, under Ascent's `#![measure_rule_times]`. Rule
   times, relation sizes, and the shape of the access paths.
 - `examples/ctadl_memory.rs` — the allocator accounting of `src/mem.rs`,
   pointed at an import. Bytes, per relation, with the indices split out.
+- `examples/ctadl_parallel.rs` — the same rules under all three of Ascent's
+  evaluators, on one import, with the relation sizes diffed between them.
+  Wall time, and what it takes to beat the sequential one.
 
-The commands for both are at the end; the short one is at the top.
+The commands for all three are at the end; the short one is at the top.
 
 ## What the input looks like
 
@@ -550,6 +553,12 @@ iteration and is a snapshot of a *longer* run than `k = 7`'s. Read them as
 "where the budget got to". `k = 8` has no column at all: `memguard.sh` killed
 it at the 64 GiB cap, and the kill takes the process before it prints.
 
+`k = 6` has since been run to convergence, and "timeout" turns out to have
+meant "needs 2553s, not 240" — see "`k = 6` converges; nobody had waited for
+it" below, which also compares that snapshot against the fixpoint it was 19%
+of the way to. The ceiling in this heading is a ceiling on *patience*, not on
+the analysis. `k = 7` and `k = 8` are still open.
+
 ### At 80 procedures, every `k` converges — and now barely grows
 
 80 procedures is where the earlier sweep found the ceiling — the largest
@@ -655,6 +664,251 @@ construction and the depth histogram tops out at 4 accessors at every `k`, on
 both the whole program and the 80-procedure cut. Nothing about raising `k`
 lengthens a path, and neither does SSA — it adds versions, not accessors.
 
+## Running it in parallel
+
+`src/analysis.rs` builds these rules three ways — one `hybrid_rules` source,
+three Ascent macros, so nothing but the evaluator differs:
+
+| backend | macro | axis |
+|---|---|---|
+| `HybridAnalysis` | `ascent!` | sequential |
+| `parallel::ParallelHybridAnalysis` | `ascent_par!` | intra-rule: a parallel iterator over each rule's delta |
+| `parallel::inter_rule::InterRuleHybridAnalysis` | `ascent_par!` + `#![inter_rule_parallelism]` | the above, plus independent rules within one SCC run concurrently |
+
+`hi-complexity.md` measures all three on the synthetic families of
+`src/families.rs` and finds parallelism losing by 6× to 1700× on everything at
+the scale of the paper's examples, breaking even only at `wide(2048, 8)` and
+winning only at `wide(8192, 8)` — thousands of independent procedures
+advancing in the same round. It closes with a caveat: `wide` has no critical
+statements in it at all, so whether the
+*hybrid inlining* rules parallelize — the ones keyed on `CritId`, fed by a
+serial chain of propagation steps — was untested, "and there is reason to
+think they would do worse."
+
+`backflash.apk` is that test. It has 473 critical statements, and between 966
+pending instances at `k = 1` and 164,693 at `k = 6`. **They parallelize.**
+
+```sh
+cargo run --features ctadl --release --example ctadl_parallel -- \
+    backflash.apk --k 4 --repeat 3
+```
+
+`examples/ctadl_parallel.rs` runs the backends over one import and diffs their
+relation sizes against the sequential run's before it reports any speedup, the
+way `benches/backends.rs` does for the families. **All 65 relations agree with
+`seq` at every `k` below**; that is the first result here and the timings are
+the second, because a backend that is fast because it derived less is a bug.
+
+### The crossover is at `k = 3`
+
+Whole program, 20 threads on a 20-core M1 Ultra, medians of three runs (two at
+`k = 5`, one at `k = 6`), which repeat to within 2%:
+
+```
+  k                       1         2         3         4         5         6*
+  tuples               523K      639K      875K     1.58M     4.25M     16.5M
+  seq                0.644s    0.894s    1.693s    6.796s   101.58s    2552.9s
+  par                1.247s    1.535s    2.222s    4.615s    32.64s         —
+  par+ir             0.834s    0.964s    1.369s    3.168s    29.36s     647.6s
+  par                 0.52x     0.58x     0.76x     1.47x     3.11x         —
+  par+ir              0.77x     0.93x     1.24x     2.15x     3.46x     3.94x
+```
+
+\* One run each at `k = 6` rather than three — the sequential fixpoint there
+takes 43 minutes, and `par` was not run at all — and its own subsection below,
+because until now no run at `k = 6` had ever finished.
+
+Wall clock here includes seeding the EDB into the Ascent program, which
+`ctadl_profile` does *outside* its timer; that is the whole of the ~0.1s by
+which this `seq` row sits above the `wall` row of the whole-program `k` table.
+The convention is the same on all three backends, so the ratios are unaffected.
+
+Two readings.
+
+**The break-even is a size, and it is the size `hi-complexity.md` predicted.**
+`par+ir` goes 0.77× → 0.93× → 1.24× across `k = 1, 2, 3`, crossing 1.0 at
+roughly 700K tuples and one second of sequential work. The `wide` family
+crossed at ~450K tuples on the same machine. Two completely different programs
+— 8192 synthetic procedures with no dispatch, and one Android app whose
+parallelism comes from context — break even within a factor of 1.5 of each
+other, which says the threshold is a property of this rule set and Ascent's
+parallel runtime rather than of either program.
+
+**On this app the width comes from `k`, not from the procedure count.** The
+program is fixed at 2375 procedures throughout that table; what grows is the
+number of pending instances, from 966 to 41,605, and with it the number of
+tuples a rule's delta carries in one round. That is a second way to get the
+delta width `wide` gets from having 8192 procedures at once, and it is the
+answer to the caveat: the `CritId`-keyed rules are not the ones that fail to
+parallelize, they are the ones supplying the width.
+
+### The tax is instructions, and it is paid in cycles that were idle anyway
+
+`/usr/bin/time -l`, one backend per process (a peak footprint is per process,
+so three fixpoints in one process report one peak):
+
+```
+                        seq        par     par+ir
+  k = 1, wall         0.649s     1.273s     0.856s
+         peak        442 MiB    437 MiB    439 MiB
+         instr         5.89G     17.45G     13.41G
+         cycles        2.42G     61.22G     40.11G
+
+  k = 4, wall         6.787s     4.636s     3.189s
+         peak       1.19 GiB   1.25 GiB   1.23 GiB
+         instr        88.11G    230.21G    221.51G
+         cycles       21.63G    231.95G    159.48G
+
+  k = 5, wall        100.83s     32.98s     29.44s
+         peak       3.30 GiB   3.62 GiB   3.54 GiB
+         instr        1757G      4836G      4821G
+         cycles      315.5G      1765G      1582G
+
+  k = 6, wall        2552.9s          —     647.6s
+         peak      10.38 GiB          —  12.73 GiB
+         instr       47,537G          —   130,102G
+         cycles       7,978G          —    35,594G
+```
+
+**Memory is a few percent, not a factor — but the few percent grows.**
+`par+ir` peaks 1% *below* sequential at `k = 1`, 3–7% above at `k = 4` and
+`k = 5`, and 20–23% above at `k = 6` (12.4 GiB and 12.7 GiB on two runs,
+against 10.38 GiB). Ascent's parallel relations are `boxcar` vectors and
+`DashMap` indices rather than `Vec` and `HashMap`, and that swap costs a
+constant fraction of a growing thing; on the largest run here it is a fifth.
+Nothing in "Where the bytes go" needs re-reading for the parallel backends,
+but a run near a memory cap should not be moved onto them without headroom.
+
+**Instructions are the price.** `par+ir` retires 2.3–2.7× the instructions the
+sequential run does, at every `k`, on identical output. That ratio barely
+moves with size, so it is the fixed cost of the concurrent data structures —
+the sharded lookup, the atomics, the re-checks — and not something that
+amortizes away.
+
+Which leaves the question of what the speedup is made of, and the two counters
+answer it between them. Apple's cycle counter is summed over threads, so
+cycles ÷ wall in units of the sequential run's own rate is how many cores were
+busy; instructions ÷ cycles is what each of them was doing:
+
+```
+                                     k = 1   k = 4   k = 5   k = 6
+  cores' worth of cycles in flight    12.6    15.7    17.2    17.6   (par+ir, of 20)
+  instructions per cycle, seq          2.43    4.07    5.57    5.96
+  instructions per cycle, par+ir       0.33    1.39    3.05    3.66
+  instruction tax                      2.28x   2.51x   2.74x   2.74x
+```
+
+Speedup is the product of the three rows: occupancy × IPC ratio ÷ tax. At
+`k = 1` that is 12.6 × 0.14 ÷ 2.28 = 0.77×, and at `k = 6` 17.6 × 0.61 ÷ 2.74
+= 3.95×, against the 0.77× and 3.94× measured. Occupancy hardly moves across
+that range, and past `k = 5` neither does the tax. **The entire difference
+between losing by a quarter and winning by 3.9× is the parallel IPC**, which
+rises 11× while the sequential one rises 2.5×.
+
+That is what makes `k = 1` legible. Twenty cores are already two-thirds busy
+there and retiring a third of an instruction per cycle each: not work,
+contention — twelve cores' worth of cycles spent spinning on deltas of a
+handful of tuples, which is `hi-complexity.md`'s diagnosis on the small
+families read directly off the counters. Parallelism does not start winning
+here by finding more cores. It wins by giving the cores it already had
+something to do.
+
+### How many threads is a function of `k`
+
+`RAYON_NUM_THREADS` swept, against the same sequential runs as above (6.796s
+at `k = 4`, 101.58s at `k = 5`):
+
+```
+  threads                 1         2         4         8        20
+  k = 4, par         7.506s    4.977s    3.650s    3.555s    4.699s
+  k = 4, par+ir      7.554s    4.615s    2.988s    2.747s    3.218s
+    vs seq            0.90x     1.47x     2.27x     2.47x     2.11x
+  k = 5, par+ir     94.466s   64.022s   40.592s   31.552s   29.540s
+    vs seq            1.08x     1.59x     2.50x     3.22x     3.44x
+```
+
+**The concurrent data structures are no longer a tax.** At one thread `par+ir`
+is 7.554s against sequential's 6.796s at `k = 4` — 11% — and at `k = 5` it is
+94.5s against 101.6s, which is 7% *faster* than sequential with no parallelism
+at all. On the synthetic families that same one-thread overhead ran from 1.3×
+to 32×, amortizing toward break-even only at the largest sizes. Here it has
+amortized past break-even. `boxcar` and `DashMap` are not the reason anything
+below `k = 3` loses.
+
+**The useful thread count moves right with `k`, and 20 is not always it.** At
+`k = 4` the curve peaks at eight threads and then *reverses* — 2.47× at eight
+against 2.11× at twenty, a 17% loss for 12 more cores. At `k = 5` it does not
+reverse: eight gives 3.22× and twenty gives 3.44×, still climbing. Under
+`#![inter_rule_parallelism]` the pool has two things to spread — the rules of
+one SCC, and each rule's delta — and stratum B has 86 rules of which ten are
+83% of the time, so what decides the peak is whether those ten rules have
+deltas big enough to keep 20 workers apart. At `k = 4` they do not. So:
+`RAYON_NUM_THREADS=8` at `k = 4`, and the whole machine from `k = 5` up.
+
+Scaling is poor in either case, and that is the honest summary of this
+section: `k = 5` goes 94.5s → 29.5s from 1 thread to 20, which is 3.2× out of
+20 cores. It is worth having and it is not close to linear.
+
+**Inter-rule parallelism is again the better axis.** `par+ir` beats plain `par`
+in every row of both tables — 1.1× to 1.6× — and the two are indistinguishable
+at one thread (7.554s against 7.506s), which is what it should look like: with
+one worker there is nothing to run concurrently and the difference is
+scheduling overhead alone. Both parts of `hi-complexity.md`'s reading survive
+contact with a real program.
+
+### `k = 6` converges; nobody had waited for it
+
+The whole-program `k` table stops calling runs converged at `k = 5` because
+`k = 6` "timed out" — `--timeout 240` is checked between iterations, that run
+overran to 490s and 18 iterations, and the column records where the budget got
+to. It was never evidence that the fixpoint does not exist. It does, and both
+backends reach it:
+
+```
+                              seq        par+ir     the old k = 6 column
+                                                    (snapshot at 490s)
+  outcome                converged     converged    timeout
+  wall                     2552.9s        647.6s    490s
+  peak                   10.38 GiB     12.73 GiB    10.36 GiB
+  tuples, all relations  16,456,234    16,456,234   --
+  pending                   164,693       164,693   155,128
+  points                  6,578,767     6,578,767   5,243,311
+  edge                    5,439,654     5,439,654   4,471,602
+  pub_points                371,848       371,848   248,535
+  pub_root                  455,695       455,695   --
+```
+
+The two backend columns are the same 65-line list, diffed — not two lists that
+agree wherever someone happened to look.
+
+Three things fall out of it.
+
+**The old snapshot was much closer to done than "timeout" suggests.** At the
+cutoff it had 94% of the final `pending`, 80% of `points`, 82% of `edge` — and
+100% of the memory: 10.36 GiB against the completed run's 10.38. The footprint
+is essentially final at 19% of the run time. Whatever the last four fifths of
+a long fixpoint here are doing, they are not allocating; they are closing over
+a structure that is already allocated. Read that back into the standing
+warning that a truncated run's relation sizes are a function of the budget:
+its *peak* may nonetheless be the real one.
+
+**`pending` again did not move.** 164,693 against the snapshot's 155,128: the
+instance space was 94% minted at 19% of the time. That is the same finding the
+preprocessing change produced from the other direction — the instances are not
+what the long tail of a run is spent on.
+
+**`k = 6` is where parallelism is worth the most and costs the most.** 3.94× is
+the best speedup measured here and 20-23% is the worst memory premium. 43
+minutes down to 11 is the difference between a run you wait for and a run you
+schedule; 10.4 GiB up to 12.7 GiB is nothing on a 128 GiB machine and would be
+the whole story on a 16 GiB one.
+
+`k = 7` is still open. Its column in the whole-program table is a 322s
+snapshot at 44.29 GiB, and nothing here says whether it converges — only that
+"timeout" was the wrong reading one column to its left. `par+ir` under
+`memguard.sh` is how to find out, and 44 GiB of snapshot against a 64 GiB cap
+says to expect the guard rather than an answer.
+
 ## What is left to try
 
 In the order the numbers argue for:
@@ -710,9 +964,11 @@ In the order the numbers argue for:
    `pub_points` grow with unchanged exponents. Everything else got 40× smaller
    around it. On a program that converges `k` limits the fixpoint
    *polynomially* — now `k^0.65` in tuples, not the `k^2.5` measured before —
-   and the whole program reaches a fixpoint out to `k = 5`. But `k >= 6` still
-   never converges, and `k = 8` is still killed at a 64 GiB cap before
-   it reports anything. If `k > 2` is wanted at full size, the instances need a
+   and the whole program reaches a fixpoint out to `k = 6` — `k = 6` in 2553s
+   sequentially and 648s under `par+ir`, which is 43 minutes and 11, not a
+   wall. `k = 7` has never been run to convergence and `k = 8` is still killed
+   at a 64 GiB cap before it reports anything. If `k > 2` is wanted at full
+   size, the instances need a
    second bound: merging instances whose decisive slot has the same points-to
    set, or a tighter `blocked`, since `blocked` is what decides whether an
    instance is copied into its callers at all.
@@ -722,7 +978,18 @@ In the order the numbers argue for:
    local data flow, and the TaintBench queries are what should decide how far
    is far enough.
 
-7. **Type-filtering congruence** — rejecting an extension whose accessor is not
+7. **Turn on `#![inter_rule_parallelism]` above `k = 2`.** Measured rather
+   than speculated — "Running it in parallel" above. It is worth 2.5× at
+   `k = 4`, 3.5× at `k = 5` and 3.9× at `k = 6`, for no change to the rules and
+   no change to what is derived; and it *costs* 23% at `k = 1`. So it is a
+   switch to throw on the expensive runs rather than a default —
+   `RAYON_NUM_THREADS=8` at `k = 4`, the whole machine above it. Two things it
+   is not: free of memory (3-7% at `k <= 5`, 20-23% at `k = 6`) and free of
+   work (2.5-2.7× the instructions, so not the lever to reach for on a shared
+   machine). And it buys throughput only — the instance space is untouched, so
+   item 5 is unaffected by it.
+
+8. **Type-filtering congruence** — rejecting an extension whose accessor is not
    a field of the static type reached so far. 3.8% of paths repeat an accessor,
    against 1.8% before, so there is slightly more fiction to remove than there
    was; but congruence is now the largest group of rule time (32%, against
@@ -813,6 +1080,25 @@ cargo build --features ctadl,profile --release --example ctadl_profile
 for k in 1 2 3 4 5 6 7 8; do
     ./scripts/memguard.sh 64 /usr/bin/time -l \
         ./target/release/examples/ctadl_profile backflash.apk --k $k --timeout 240
+done
+
+# sequential vs. the two parallel evaluators, with the relation sizes diffed
+# between them first.  `--backend X` runs one alone, which is what to do under
+# `/usr/bin/time -l`: a peak footprint is per process.
+cargo run --features ctadl --release --example ctadl_parallel -- \
+    backflash.apk --k 4 --repeat 3
+for t in 1 2 4 8 20; do
+    RAYON_NUM_THREADS=$t ./target/release/examples/ctadl_parallel \
+        backflash.apk --k 4 --repeat 2 --backend par --backend par+ir
+done
+
+# k = 6 to convergence: 648s under par+ir, 2553s sequentially, and the same 65
+# relation sizes from both.  This is the run the whole-program k table above
+# only ever had a 490s snapshot of.
+cargo build --features ctadl --release --example ctadl_parallel
+for b in par+ir seq; do
+    ./scripts/memguard.sh 64 /usr/bin/time -l \
+        ./target/release/examples/ctadl_parallel backflash.apk --k 6 --repeat 1 --backend $b
 done
 
 # the same run with the front end's IR passes off, which is the configuration

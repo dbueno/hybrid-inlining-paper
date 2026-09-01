@@ -22,6 +22,14 @@ quantity that is now computed instead of stored, and everything else as
 current. Re-running `cargo run --release --example complexity` regenerates the
 tables without them.
 
+**`path_used` is also gone, and that one does change the numbers.** `421a6be`
+replaced it with `cat` and `used_ext`. Wherever a table below has a
+`path_used` row, the relation no longer exists, and on `fields(n)` its
+replacements are near-cubic where it was quadratic — see *Time is not the
+same shape as tuple count*. The two parallel-evaluation sections and that one
+were re-measured on 2026-08-31 at `978ed29` and are current; everything above
+them is not.
+
 The programs being measured are the parametric families in `src/families.rs`.
 Each turns one integer knob into a program of a fixed shape, so a fit against
 the program's EDB fact count `|P|` says something about the relation rather
@@ -454,32 +462,42 @@ number is criterion's median over 10 samples; the confidence intervals are in
 and the sizes are `examples/complexity.rs`'s job.
 
 ```
-  case                           |P|         seq         par      par+ir    par×     ir×
-  figure1, k = 4                  82      0.19ms    313.33ms    199.03ms   0.00x   0.00x
-  chain(8), k = n+2              122      0.40ms    538.75ms    328.56ms   0.00x   0.00x
-  chain(32), k = n+2             386      2.61ms   1667.00ms    973.94ms   0.00x   0.00x
-  chain(128), k = n+2           1442     44.82ms   6352.10ms   3646.40ms   0.01x   0.01x
-  chain(256), k = n+2           2850    246.15ms  12787.00ms   7402.60ms   0.02x   0.03x
-  fanin(8), k = 3                162      0.27ms    214.92ms    142.06ms   0.00x   0.00x
-  fanin(32), k = 3               570      0.84ms    227.14ms    148.43ms   0.00x   0.01x
-  fanin(128), k = 3             2202      3.21ms    238.52ms    158.53ms   0.01x   0.02x
-  fanin(512), k = 3             8730     13.33ms    278.48ms    192.56ms   0.05x   0.07x
-  branching(6), k = d+2          142      2.85ms    473.87ms    291.81ms   0.01x   0.01x
-  branching(8), k = d+2          178     12.18ms    630.46ms    389.35ms   0.02x   0.03x
-  branching(10), k = d+2         214     56.61ms    898.62ms    602.96ms   0.06x   0.09x
-  branching(12), k = d+2         250    299.66ms   1665.70ms   1273.10ms   0.18x   0.24x
-  alias(64)                      385      1.05ms    710.86ms    472.75ms   0.00x   0.00x
-  alias(128)                     769      3.63ms   1352.60ms    889.84ms   0.00x   0.00x
-  alias(256)                    1537     14.90ms   2661.40ms   1749.30ms   0.01x   0.01x
-  fields(16)                      38      1.12ms    589.71ms    392.56ms   0.00x   0.00x
-  fields(32)                      70      7.95ms   1098.20ms    715.19ms   0.01x   0.01x
-  fields(64)                     134     78.15ms   2196.00ms   1440.00ms   0.04x   0.05x
-  fields_chain(32)               367      2.22ms   3083.70ms   1968.20ms   0.00x   0.00x
-  fields_chain(128)             1423     20.58ms  12044.00ms   7623.00ms   0.00x   0.00x
+  case                             |P|         seq         par      par+ir    par×     ir×
+  figure1, k = 4                    82      0.15ms    253.91ms    168.73ms   0.00x   0.00x
+  chain(8), k = n+2                122      0.31ms    483.99ms    302.96ms   0.00x   0.00x
+  chain(32), k = n+2               386      1.80ms   1494.96ms    909.60ms   0.00x   0.00x
+  chain(128), k = n+2             1442     28.06ms   5614.15ms   3391.68ms   0.00x   0.01x
+  chain(256), k = n+2             2850    151.22ms  11250.72ms   6806.59ms   0.01x   0.02x
+  fanin(8), k = 3                  162      0.22ms    184.71ms    126.54ms   0.00x   0.00x
+  fanin(32), k = 3                 570      0.68ms    187.69ms    130.21ms   0.00x   0.01x
+  fanin(128), k = 3               2202      2.60ms    202.39ms    138.83ms   0.01x   0.02x
+  fanin(512), k = 3               8730     10.72ms    233.34ms    163.64ms   0.05x   0.07x
+  branching(6), k = d+2            142      2.16ms    418.73ms    268.05ms   0.01x   0.01x
+  branching(8), k = d+2            178      8.96ms    547.97ms    346.66ms   0.02x   0.03x
+  branching(10), k = d+2           214     41.57ms    768.96ms    513.33ms   0.05x   0.08x
+  branching(12), k = d+2           250    215.14ms   1335.91ms   1001.43ms   0.16x   0.21x
+  alias(64)                        385      1.01ms    645.39ms    447.29ms   0.00x   0.00x
+  alias(128)                       769      3.54ms   1244.42ms    833.38ms   0.00x   0.00x
+  alias(256)                      1537     15.53ms   2449.91ms   1628.99ms   0.01x   0.01x
+  fields(16)                        38      2.45ms    533.73ms    362.46ms   0.00x   0.01x
+  fields(32)                        70     22.86ms   1018.52ms    675.35ms   0.02x   0.03x
+  fields(64)                       134    311.60ms   2109.59ms   1438.43ms   0.15x   0.22x
+  fields_chain(32)                 367      0.21ms    144.17ms    107.29ms   0.00x   0.00x
+  fields_chain(128)               1423      0.70ms    145.01ms    108.41ms   0.00x   0.01x
 ```
 
-Both parallel backends are **5× to 1700× slower than sequential**, on every
-single case. On Figure 1 itself: 0.19 ms sequential against 313 ms parallel.
+Two rows moved since the tables earlier in this document were taken, and the
+cause is the rule set rather than the evaluator: `path_used` is gone, replaced
+by `used_ext` and `cat`. That makes `fields_chain(n)` dramatically cheaper
+(0.21 ms sequential at `n = 32`, against 2.22 ms before) and `fields(n)`
+markedly more expensive (311.6 ms at `n = 64`, against 78.2 ms), because
+`used_ext` and `cat` are themselves superlinear on `fields` — 49,920 and
+45,760 tuples at `n = 64`, where `path_used` had 2,278. The backend
+comparison is unaffected, since all three run the same rules, but the `seq`
+column should not be read against the older tables above.
+
+Both parallel backends are **6× to 1700× slower than sequential**, on every
+single case. On Figure 1 itself: 0.15 ms sequential against 254 ms parallel.
 (The `wide` family is measured separately below; it is the case where this
 stops being true.)
 
@@ -489,51 +507,51 @@ in each other's way. `RAYON_NUM_THREADS=1` separates them — same parallel
 programs, same concurrent data structures, but no actual parallelism:
 
 ```
-  case                           |P|         seq         par      par+ir    par×     ir×
-  figure1, k = 4                  82      0.19ms      5.82ms      4.64ms   0.03x   0.04x
-  chain(8), k = n+2              122      0.40ms     10.75ms      8.13ms   0.04x   0.05x
-  chain(32), k = n+2             386      2.62ms     35.18ms     26.43ms   0.07x   0.10x
-  chain(128), k = n+2           1442     45.11ms    193.00ms    156.04ms   0.23x   0.29x
-  chain(256), k = n+2           2850    248.26ms    658.01ms    562.88ms   0.38x   0.44x
-  fanin(8), k = 3                162      0.27ms      4.56ms      3.69ms   0.06x   0.07x
-  fanin(32), k = 3               570      0.83ms      5.53ms      4.57ms   0.15x   0.18x
-  fanin(128), k = 3             2202      3.23ms      9.36ms      8.22ms   0.35x   0.39x
-  fanin(512), k = 3             8730     13.35ms     24.25ms     22.60ms   0.55x   0.59x
-  branching(6), k = d+2          142      2.92ms     13.46ms     11.02ms   0.22x   0.26x
-  branching(8), k = d+2          178     12.17ms     30.02ms     26.32ms   0.41x   0.46x
-  branching(10), k = d+2         214     56.88ms     96.31ms     91.78ms   0.59x   0.62x
-  branching(12), k = d+2         250    299.21ms    416.76ms    409.81ms   0.72x   0.73x
-  alias(64)                      385      1.04ms     14.69ms     12.28ms   0.07x   0.08x
-  alias(128)                     769      3.63ms     30.26ms     25.03ms   0.12x   0.14x
-  alias(256)                    1537     15.20ms     70.18ms     59.33ms   0.22x   0.26x
-  fields(16)                      38      1.11ms     13.01ms     10.59ms   0.09x   0.10x
-  fields(32)                      70      7.90ms     34.38ms     29.45ms   0.23x   0.27x
-  fields(64)                     134     78.40ms    185.50ms    174.89ms   0.42x   0.45x
-  fields_chain(32)               367      2.21ms     57.58ms     46.90ms   0.04x   0.05x
-  fields_chain(128)             1423     20.55ms    244.17ms    202.63ms   0.08x   0.10x
+  case                             |P|         seq         par      par+ir    par×     ir×
+  figure1, k = 4                    82      0.15ms      4.74ms      3.80ms   0.03x   0.04x
+  chain(8), k = n+2                122      0.31ms      8.73ms      6.80ms   0.04x   0.05x
+  chain(32), k = n+2               386      1.79ms     28.15ms     21.56ms   0.06x   0.08x
+  chain(128), k = n+2             1442     28.15ms    140.72ms    114.54ms   0.20x   0.25x
+  chain(256), k = n+2             2850    151.10ms    435.73ms    379.85ms   0.35x   0.40x
+  fanin(8), k = 3                  162      0.21ms      3.60ms      2.95ms   0.06x   0.07x
+  fanin(32), k = 3                 570      0.68ms      4.31ms      3.67ms   0.16x   0.18x
+  fanin(128), k = 3               2202      2.59ms      7.16ms      6.42ms   0.36x   0.40x
+  fanin(512), k = 3               8730     10.72ms     18.28ms     17.52ms   0.59x   0.61x
+  branching(6), k = d+2            142      2.15ms     10.61ms      8.72ms   0.20x   0.25x
+  branching(8), k = d+2            178      8.98ms     22.24ms     19.98ms   0.40x   0.45x
+  branching(10), k = d+2           214     41.60ms     68.44ms     66.33ms   0.61x   0.63x
+  branching(12), k = d+2           250    215.07ms    282.95ms    283.47ms   0.76x   0.76x
+  alias(64)                        385      1.00ms     12.49ms     10.47ms   0.08x   0.10x
+  alias(128)                       769      3.55ms     26.13ms     22.05ms   0.14x   0.16x
+  alias(256)                      1537     15.54ms     61.16ms     53.78ms   0.25x   0.29x
+  fields(16)                        38      2.45ms     13.30ms     11.33ms   0.18x   0.22x
+  fields(32)                        70     22.87ms     54.33ms     49.97ms   0.42x   0.46x
+  fields(64)                       134    312.29ms    519.72ms    509.84ms   0.60x   0.61x
+  fields_chain(32)                 367      0.21ms      2.75ms      2.48ms   0.07x   0.08x
+  fields_chain(128)               1423      0.69ms      3.48ms      3.20ms   0.20x   0.22x
 ```
 
 This is the interesting result. **Going from 1 rayon thread to 20 makes the
-parallel backend 4× to 54× slower**, not faster:
+parallel backend 4× to 55× slower**, not faster:
 
 | case | par @ 1 thread | par @ 20 threads | penalty |
 |---|---|---|---|
-| `figure1` | 5.8 ms | 313.3 ms | 53.8× |
-| `chain(32)` | 35.2 ms | 1667.0 ms | 47.4× |
-| `fields_chain(128)` | 244.2 ms | 12044.0 ms | 49.3× |
-| `alias(256)` | 70.2 ms | 2661.4 ms | 37.9× |
-| `chain(256)` | 658.0 ms | 12787.0 ms | 19.4× |
-| `fanin(512)` | 24.2 ms | 278.5 ms | 11.5× |
-| `branching(12)` | 416.8 ms | 1665.7 ms | 4.0× |
+| `figure1` | 4.7 ms | 253.9 ms | 53.5× |
+| `chain(32)` | 28.2 ms | 1495.0 ms | 53.1× |
+| `fields_chain(128)` | 3.5 ms | 145.0 ms | 41.7× |
+| `alias(256)` | 61.2 ms | 2449.9 ms | 40.1× |
+| `chain(256)` | 435.7 ms | 11250.7 ms | 25.8× |
+| `fanin(512)` | 18.3 ms | 233.3 ms | 12.8× |
+| `branching(12)` | 283.0 ms | 1335.9 ms | 4.7× |
 
 So the diagnosis is not "concurrent data structures are expensive" — at one
-thread the overhead is a modest 1.4×–31×, and it *amortizes away* as the work
-grows: `branching(12)` reaches 0.72× of sequential, `fanin(512)` 0.55×, and
+thread the overhead is a modest 1.3×–32×, and it *amortizes away* as the work
+grows: `branching(12)` reaches 0.76× of sequential, `fanin(512)` 0.59×, and
 the trend across each family is monotone toward break-even. The diagnosis is
 **contention and dispatch across threads on deltas that are far too small**.
 This program has roughly 90 rules; each round hands most of them a delta of a
 handful of tuples, and paying rayon's fork/join plus cross-shard `DashMap`
-traffic on those is pure loss. The penalty shrinks (55× → 4.2×) exactly as the
+traffic on those is pure loss. The penalty shrinks (54× → 4.7×) exactly as the
 per-round work grows, which is the same story from the other direction.
 
 Two further readings:
@@ -548,7 +566,7 @@ enough to overcome the per-rule overhead.
 
 **Nothing above is big enough for parallelism to pay.** Extrapolating the
 1-thread trend, the concurrent data structures stop costing anything around
-`branching(12)`-scale work (~400k tuples). Multi-threading would then need
+`branching(12)`-scale work (~330k tuples). Multi-threading would then need
 deltas large enough to amortize fork/join, which on this rule set means
 something one or two orders of magnitude larger again. That prediction turned
 out to be right, and the next section is the family that reaches it.
@@ -565,55 +583,55 @@ rule sees grows with `m` instead of staying at a handful of tuples.
 20 threads:
 
 ```
-  case                           |P|         seq         par      par+ir    par×     ir×
-  wide(32, 8)                   1916      2.00ms    251.88ms    178.25ms   0.01x   0.01x
-  wide(128, 8)                  7652      8.40ms    265.65ms    188.65ms   0.03x   0.04x
-  wide(512, 8)                 30596     46.55ms    297.89ms    212.17ms   0.16x   0.22x
-  wide(2048, 8)               122372    294.51ms    389.62ms    293.79ms   0.76x   1.00x
-  wide(8192, 8)               489486   1628.20ms    743.59ms    614.05ms   2.19x   2.65x
-  wide(128, 4)                  4580      4.08ms    214.23ms    154.45ms   0.02x   0.03x
-  wide(128, 8)                  7652      8.68ms    268.86ms    189.03ms   0.03x   0.05x
-  wide(128, 16)                13796     24.38ms    372.27ms    261.49ms   0.07x   0.09x
+  case                             |P|         seq         par      par+ir    par×     ir×
+  wide(32, 8)                     1916      1.88ms    218.84ms    156.68ms   0.01x   0.01x
+  wide(128, 8)                    7652      7.91ms    231.36ms    165.47ms   0.03x   0.05x
+  wide(512, 8)                   30596     44.31ms    259.38ms    185.85ms   0.17x   0.24x
+  wide(2048, 8)                 122372    267.64ms    349.26ms    270.23ms   0.77x   0.99x
+  wide(8192, 8)                 489476   1486.46ms    714.19ms    600.24ms   2.08x   2.48x
+  wide(128, 4)                    4580      3.66ms    185.99ms    135.55ms   0.02x   0.03x
+  wide(128, 8)                    7652      8.00ms    233.66ms    168.70ms   0.03x   0.05x
+  wide(128, 16)                  13796     23.86ms    331.21ms    233.39ms   0.07x   0.10x
 ```
 
 `RAYON_NUM_THREADS=1`, the same programs:
 
 ```
-  case                           |P|         seq         par      par+ir    par×     ir×
-  wide(32, 8)                   1916      2.00ms      7.56ms      6.77ms   0.26x   0.30x
-  wide(128, 8)                  7652      8.50ms     17.08ms     16.11ms   0.50x   0.53x
-  wide(512, 8)                 30596     47.90ms     65.58ms     65.26ms   0.73x   0.73x
-  wide(2048, 8)               122370    295.23ms    339.24ms    337.38ms   0.87x   0.88x
-  wide(8192, 8)               489470   1654.90ms   1955.80ms   1949.40ms   0.85x   0.85x
-  wide(128, 4)                  4580      4.04ms     10.39ms      9.52ms   0.39x   0.42x
-  wide(128, 8)                  7652      8.48ms     17.69ms     16.80ms   0.48x   0.50x
-  wide(128, 16)                13796     24.71ms     40.88ms     39.13ms   0.60x   0.63x
+  case                             |P|         seq         par      par+ir    par×     ir×
+  wide(32, 8)                     1916      1.86ms      6.63ms      5.96ms   0.28x   0.31x
+  wide(128, 8)                    7652      7.89ms     15.31ms     14.53ms   0.52x   0.54x
+  wide(512, 8)                   30596     44.02ms     58.86ms     58.34ms   0.75x   0.75x
+  wide(2048, 8)                 122372    262.20ms    295.53ms    294.35ms   0.89x   0.89x
+  wide(8192, 8)                 489476   1465.40ms   1654.12ms   1655.75ms   0.89x   0.89x
+  wide(128, 4)                    4580      3.64ms      8.63ms      8.01ms   0.42x   0.45x
+  wide(128, 8)                    7652      7.94ms     15.18ms     14.58ms   0.52x   0.54x
+  wide(128, 16)                  13796     23.78ms     36.08ms     35.32ms   0.66x   0.67x
 ```
 
 **`wide(8192, 8)` is the first case in the suite where a parallel backend
-beats sequential**: `par+ir` at 2.65×, `par` at 2.19×. Three things make this
+beats sequential**: `par+ir` at 2.48×, `par` at 2.08×. Three things make this
 readable rather than lucky.
 
 *It is threads, not the data structures.* At one thread the same program is
-0.85× — the concurrent-structure overhead has flattened to a stable ~12–15%
-tax that no longer grows with size, exactly as the 1-thread trend above
-predicted. Everything beyond that is real parallel speedup: 1949 ms at one
-thread against 614 ms at twenty.
+0.89× — the concurrent-structure overhead has flattened to a stable ~11% tax
+that no longer grows with size, exactly as the 1-thread trend above predicted.
+Everything beyond that is real parallel speedup: 1656 ms at one thread against
+600 ms at twenty, which is 2.8× out of 20 cores.
 
-*The crossover is a size, and it is knowable.* `par+ir` goes 0.01× → 0.04× →
-0.22× → 1.00× → 2.65× across a 256× range in `m`, breaking even almost exactly
-at `wide(2048, 8)` — call it ~120k EDB facts and ~480k tuples on this machine
+*The crossover is a size, and it is knowable.* `par+ir` goes 0.01× → 0.05× →
+0.24× → 0.99× → 2.48× across a 256× range in `m`, breaking even almost exactly
+at `wide(2048, 8)` — call it ~120k EDB facts and ~450k tuples on this machine
 (20-core M1 Ultra). Below that the per-round fork/join toll dominates; the
-parallel column is nearly flat from `wide(32)` to `wide(512)` (252 → 298 ms
-while sequential grows 23×), which is what a fixed toll looks like.
+parallel column is nearly flat from `wide(32)` to `wide(512)` (219 → 259 ms
+while sequential grows 24×), which is what a fixed toll looks like.
 
 Holding `m` fixed and widening the local closure instead — `wide(128, w)` —
-moves nothing: `par+ir` is 0.03× at `w = 4` and 0.09× at `w = 16`. More work
+moves nothing: `par+ir` is 0.03× at `w = 4` and 0.10× at `w = 16`. More work
 per procedure is not more width, and only width pays.
 
-*Width is what matters, not tuple count.* `branching(12)` has 394k tuples and
-still runs at 0.24×; `wide(2048, 8)` has 482k — comparable — and reaches
-1.00×. The difference is that `branching`'s tuples are produced by a long
+*Width is what matters, not tuple count.* `branching(12)` has 332k tuples and
+still runs at 0.21×; `wide(2048, 8)` has 453k — comparable — and reaches
+0.99×. The difference is that `branching`'s tuples are produced by a long
 serial chain of rounds over one exploding relation, while `wide`'s are
 produced by thousands of independent procedures at once. **The predictor of
 parallel payoff on this rule set is delta width per round, and delta width
@@ -638,24 +656,41 @@ obvious next measurement.
 ### Time is not the same shape as tuple count
 
 The sequential column also makes visible what the relation sizes hide.
-`fields(n)` goes 584 → 1,904 → 6,848 tuples (the `Θ(n²)` from suffix
-congruence) while sequential time goes 1.11 ms → 7.95 ms → 78.2 ms. Tuples grow
-~3.3× per step; time grows 7.1× then 9.8×. The extra factor is access-path
-length: paths here reach depth `n`, and every hash and comparison on an
-`AccessPath` is `O(depth)`. Cost per tuple makes it plainest —
-`fields_chain(256)` spends 5.4 µs per tuple (13,634 tuples, 73.6 ms) against
-`alias(512)`'s 0.46 µs (138,511 tuples, 63.8 ms), a 12× difference for the same
-evaluator on the same machine.
+`fields(n)` goes 2,437 → 14,829 → 102,333 tuples at `n` = 16, 32, 64 while
+sequential time goes 2.51 ms → 23.46 ms → 316.95 ms. Tuples grow ~6.5× per
+step; time grows 9.3× then 13.5×.
+
+Two things are stacked in that. The tuple count itself is no longer the
+`Θ(n²)` of suffix congruence: `edge` and `points` are still quadratic
+(172 → 596 → 2,212), but `cat` and `used_ext` — which `421a6be` introduced in
+place of `path_used` — grow like `n³` (816 → 5,984 → 45,760 and
+1,088 → 7,040 → 49,920 over the same three points). `path_used` was 190 → 630
+→ 2,278 there. On top of that sits access-path length: paths here reach depth
+`n`, and every hash and comparison on an `AccessPath` is `O(depth)`. Cost per
+tuple makes the second factor plainest — `fields(64)` spends 3.1 µs per tuple
+(102,333 tuples, 316.9 ms) against `alias(512)`'s 0.48 µs (137,486 tuples,
+65.3 ms), a 6.5× difference for the same evaluator on the same machine, on
+top of the extra tuples.
+
+The trade `421a6be` made is legible in the other direction too: `fields_chain`,
+which is the same field chain spread over `n` procedures rather than one,
+went from 73.6 ms at `n` = 256 to 1.61 ms, and from 5.4 µs per tuple to
+0.18 µs (9,025 tuples). Factoring the join out is a large win where the
+suffixes are shared across procedures and a large loss where one procedure
+accumulates them all. `fields(n)` is the family to watch if that is worth
+revisiting.
 
 `cargo bench --bench families` is the target that makes this axis its own
 measurement: a least-squares fit of its medians against the family parameter
-gives `fields(n)` an exponent of **2.8 in time** where the tuple count is
-quadratic, and `wide(m, 8)` **1.3 in time** where every relation is linear
-in `m`.
+gives `fields(n)` an exponent of **3.2 in time**, `alias(n)` **2.0**,
+`fields_chain(n)` **0.94**, and `wide(m, 8)` **1.2** where every relation is
+linear in `m`.
 
-So the honest summary of the access-path domain is: quadratic in tuples,
-super-quadratic in time, and unbounded in depth. A depth limit on access paths
-is the one piece of the standard toolkit this implementation is missing.
+So the honest summary of the access-path domain is: quadratic in tuples for
+the points-to relations, near-cubic for the suffix bookkeeping `cat`/`used_ext`
+on a single deep procedure, super-quadratic in time, and unbounded in depth. A
+depth limit on access paths is the one piece of the standard toolkit this
+implementation is missing.
 
 ## Regression guards
 

@@ -78,3 +78,7 @@ required-features = ["ctadl"]
 [[example]]
 name = "dispatch_diff"
 required-features = ["ctadl"]
+
+[[example]]
+name = "ctadl_parallel"
+required-features = ["ctadl"]
